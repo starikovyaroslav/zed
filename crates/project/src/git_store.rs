@@ -32,6 +32,7 @@ use futures::{
 use git::{
     BuildPermalinkParams, GitHostingProviderRegistry, Oid, RunHook,
     blame::Blame,
+    operation::{GitOperation, GitOperationAction, GitOperationResult, GitOperationState},
     parse_git_remote_url,
     repository::{
         Branch, BranchesScanResult, CommitData, CommitDetails, CommitDiff, CommitFile,
@@ -443,6 +444,10 @@ pub struct RepositorySnapshot {
     pub head_commit: Option<CommitDetails>,
     pub scan_id: u64,
     pub merge: MergeDetails,
+    pub operation: Option<GitOperationState>,
+    pub operation_dirty_worktree: bool,
+    pub operation_staged_changes: bool,
+    pub operation_detached_head: bool,
     pub remote_origin_url: Option<String>,
     pub remote_upstream_url: Option<String>,
     pub stash_entries: GitStash,
@@ -603,6 +608,7 @@ pub enum RepositoryEvent {
     PendingOpsChanged { pending_ops: SumTree<PendingOps> },
     GraphEvent((LogSource, LogOrder), GitGraphEvent),
     GitDirectoryChanged,
+    OperationStateChanged,
 }
 
 #[derive(Clone, Debug)]
@@ -792,6 +798,8 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_commit);
         client.add_entity_request_handler(Self::handle_run_hook);
         client.add_entity_request_handler(Self::handle_reset);
+        client.add_entity_request_handler(Self::handle_git_operation);
+        client.add_entity_request_handler(Self::handle_git_operation_action);
         client.add_entity_request_handler(Self::handle_show);
         client.add_entity_request_handler(Self::handle_create_checkpoint);
         client.add_entity_request_handler(Self::handle_create_archive_checkpoint);
@@ -3886,6 +3894,38 @@ impl GitStore {
         Ok(proto::Ack {})
     }
 
+    async fn handle_git_operation(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitOperationRequest>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::GitOperationResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let operation = operation_from_proto(envelope.payload)?;
+        let result = repository
+            .update(&mut cx, |repository, cx| {
+                repository.start_operation(operation, cx)
+            })
+            .await?;
+        Ok(operation_result_to_proto(result))
+    }
+
+    async fn handle_git_operation_action(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitOperationActionRequest>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::GitOperationResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let action = operation_action_from_proto(envelope.payload.action)?;
+        let result = repository
+            .update(&mut cx, |repository, cx| {
+                repository.apply_operation_action(action, cx)
+            })
+            .await?;
+        Ok(operation_result_to_proto(result))
+    }
+
     async fn handle_checkout_files(
         this: Entity<Self>,
         envelope: TypedEnvelope<proto::GitCheckoutFiles>,
@@ -5165,6 +5205,10 @@ impl RepositorySnapshot {
             head_commit: None,
             scan_id: 0,
             merge: Default::default(),
+            operation: None,
+            operation_dirty_worktree: false,
+            operation_staged_changes: false,
+            operation_detached_head: false,
             remote_origin_url: None,
             remote_upstream_url: None,
             stash_entries: Default::default(),
@@ -5218,6 +5262,10 @@ impl RepositorySnapshot {
                 .iter()
                 .map(worktree_to_proto)
                 .collect(),
+            operation: self.operation.as_ref().map(operation_state_to_proto),
+            operation_dirty_worktree: self.operation_dirty_worktree,
+            operation_staged_changes: self.operation_staged_changes,
+            operation_detached_head: self.operation_detached_head,
         }
     }
 
@@ -5305,6 +5353,10 @@ impl RepositorySnapshot {
                 .iter()
                 .map(worktree_to_proto)
                 .collect(),
+            operation: self.operation.as_ref().map(operation_state_to_proto),
+            operation_dirty_worktree: self.operation_dirty_worktree,
+            operation_staged_changes: self.operation_staged_changes,
+            operation_detached_head: self.operation_detached_head,
         }
     }
 
@@ -6198,6 +6250,116 @@ impl Repository {
         }
 
         receiver
+    }
+
+    pub fn start_operation(
+        &mut self,
+        operation: GitOperation,
+        cx: &mut Context<Self>,
+    ) -> oneshot::Receiver<GitOperationResult> {
+        let id = self.id;
+        let this = cx.weak_entity();
+        let updates_tx = self
+            .git_store()
+            .and_then(|git_store| match &git_store.read(cx).state {
+                GitStoreState::Local { downstream, .. } => downstream
+                    .as_ref()
+                    .map(|downstream| downstream.updates_tx.clone()),
+                _ => None,
+            });
+        self.send_job(
+            "start_git_operation",
+            Some(format!("git {}", operation.kind()).into()),
+            move |state, mut cx| async move {
+                match state {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        let result = backend.start_operation(operation).await;
+                        if let Some(this) = this.upgrade() {
+                            let snapshot = compute_snapshot(this.clone(), backend, &mut cx).await;
+                            if let Some(updates_tx) = updates_tx {
+                                updates_tx
+                                    .unbounded_send(DownstreamUpdate::UpdateRepository(snapshot))
+                                    .ok();
+                            }
+                        }
+                        result
+                    }
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        match client
+                            .request(proto::GitOperationRequest {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                                operation: Some(operation_to_proto(operation)),
+                            })
+                            .await
+                        {
+                            Ok(response) => operation_result_from_proto(response),
+                            Err(error) => Err(git::operation::GitOperationError {
+                                code: git::operation::GitOperationErrorCode::ProcessFailed,
+                                message: error.to_string(),
+                                stderr: String::new(),
+                                state: None,
+                            }),
+                        }
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn apply_operation_action(
+        &mut self,
+        action: GitOperationAction,
+        cx: &mut Context<Self>,
+    ) -> oneshot::Receiver<GitOperationResult> {
+        let id = self.id;
+        let this = cx.weak_entity();
+        let updates_tx = self
+            .git_store()
+            .and_then(|git_store| match &git_store.read(cx).state {
+                GitStoreState::Local { downstream, .. } => downstream
+                    .as_ref()
+                    .map(|downstream| downstream.updates_tx.clone()),
+                _ => None,
+            });
+        self.send_job(
+            "apply_git_operation_action",
+            Some(format!("git operation {action:?}").into()),
+            move |state, mut cx| async move {
+                match state {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        let result = backend.apply_operation_action(action).await;
+                        if let Some(this) = this.upgrade() {
+                            let snapshot = compute_snapshot(this.clone(), backend, &mut cx).await;
+                            if let Some(updates_tx) = updates_tx {
+                                updates_tx
+                                    .unbounded_send(DownstreamUpdate::UpdateRepository(snapshot))
+                                    .ok();
+                            }
+                        }
+                        result
+                    }
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        match client
+                            .request(proto::GitOperationActionRequest {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                                action: operation_action_to_proto(action),
+                            })
+                            .await
+                        {
+                            Ok(response) => operation_result_from_proto(response),
+                            Err(error) => Err(git::operation::GitOperationError {
+                                code: git::operation::GitOperationErrorCode::ProcessFailed,
+                                message: error.to_string(),
+                                stderr: String::new(),
+                                state: None,
+                            }),
+                        }
+                    }
+                }
+            },
+        )
     }
 
     pub fn show(&mut self, commit: String) -> oneshot::Receiver<Result<CommitDetails>> {
@@ -8878,6 +9040,22 @@ impl Repository {
             self.snapshot.branch_list_error = new_branch_list_error;
         }
 
+        let operation = update
+            .operation
+            .map(operation_state_from_proto)
+            .transpose()?;
+        if self.snapshot.operation != operation
+            || self.snapshot.operation_dirty_worktree != update.operation_dirty_worktree
+            || self.snapshot.operation_staged_changes != update.operation_staged_changes
+            || self.snapshot.operation_detached_head != update.operation_detached_head
+        {
+            cx.emit(RepositoryEvent::OperationStateChanged);
+        }
+        self.snapshot.operation = operation;
+        self.snapshot.operation_dirty_worktree = update.operation_dirty_worktree;
+        self.snapshot.operation_staged_changes = update.operation_staged_changes;
+        self.snapshot.operation_detached_head = update.operation_detached_head;
+
         // We don't store any merge head state for downstream projects; the upstream
         // will track it and we will just get the updated conflicts
         let new_merge_heads = TreeMap::from_ordered_entries(
@@ -9983,6 +10161,260 @@ fn commit_data_from_proto(commit: proto::CommitData) -> Result<CommitData> {
     })
 }
 
+fn operation_state_to_proto(state: &GitOperationState) -> proto::GitOperationState {
+    proto::GitOperationState {
+        kind: match state.kind {
+            git::operation::GitOperationKind::Merge => proto::GitOperationKind::Merge,
+            git::operation::GitOperationKind::Rebase => proto::GitOperationKind::Rebase,
+            git::operation::GitOperationKind::CherryPick => proto::GitOperationKind::CherryPick,
+            git::operation::GitOperationKind::Revert => proto::GitOperationKind::Revert,
+        }
+        .into(),
+        progress: state.progress.map(|progress| proto::GitOperationProgress {
+            current: progress.current as u64,
+            total: progress.total as u64,
+        }),
+        conflicts: state
+            .conflicts
+            .iter()
+            .map(|path| path.as_unix_str().to_owned())
+            .collect(),
+        required_input: state.required_input.map(|input| match input {
+            git::operation::GitOperationInput::ResolveConflicts => {
+                proto::GitOperationInput::ResolveConflicts
+            }
+            git::operation::GitOperationInput::CommitMessage => {
+                proto::GitOperationInput::CommitMessage
+            }
+            git::operation::GitOperationInput::EditRebasePlan => {
+                proto::GitOperationInput::EditRebasePlan
+            }
+        } as i32),
+        available_actions: state
+            .available_actions
+            .iter()
+            .map(|action| operation_action_to_proto(*action))
+            .collect(),
+        original_head: state.original_head.clone(),
+        target: state.target.clone(),
+    }
+}
+
+fn operation_to_proto(operation: GitOperation) -> proto::git_operation_request::Operation {
+    use proto::git_operation_request as request;
+    match operation {
+        GitOperation::Merge { commit, no_commit } => {
+            request::Operation::Merge(request::Merge { commit, no_commit })
+        }
+        GitOperation::Rebase { upstream } => {
+            request::Operation::Rebase(request::Rebase { upstream })
+        }
+        GitOperation::CherryPick { commits } => {
+            request::Operation::CherryPick(request::CherryPick { commits })
+        }
+        GitOperation::Revert { commits, no_commit } => {
+            request::Operation::Revert(request::Revert { commits, no_commit })
+        }
+    }
+}
+
+fn operation_from_proto(request: proto::GitOperationRequest) -> Result<GitOperation> {
+    use proto::git_operation_request::Operation;
+    Ok(match request.operation.context("missing Git operation")? {
+        Operation::Merge(merge) => GitOperation::Merge {
+            commit: merge.commit,
+            no_commit: merge.no_commit,
+        },
+        Operation::Rebase(rebase) => GitOperation::Rebase {
+            upstream: rebase.upstream,
+        },
+        Operation::CherryPick(cherry_pick) => GitOperation::CherryPick {
+            commits: cherry_pick.commits,
+        },
+        Operation::Revert(revert) => GitOperation::Revert {
+            commits: revert.commits,
+            no_commit: revert.no_commit,
+        },
+    })
+}
+
+fn operation_result_to_proto(result: GitOperationResult) -> proto::GitOperationResponse {
+    match result {
+        Ok(git::operation::GitOperationOutcome::Completed) => proto::GitOperationResponse {
+            completed: true,
+            state: None,
+            error: None,
+        },
+        Ok(git::operation::GitOperationOutcome::InProgress(state)) => proto::GitOperationResponse {
+            completed: false,
+            state: Some(operation_state_to_proto(&state)),
+            error: None,
+        },
+        Err(error) => proto::GitOperationResponse {
+            completed: false,
+            state: None,
+            error: Some(proto::git_operation_response::Error {
+                code: match error.code {
+                    git::operation::GitOperationErrorCode::OperationInProgress => {
+                        proto::git_operation_response::error::Code::OperationInProgress
+                    }
+                    git::operation::GitOperationErrorCode::NoOperationInProgress => {
+                        proto::git_operation_response::error::Code::NoOperationInProgress
+                    }
+                    git::operation::GitOperationErrorCode::DirtyWorktree => {
+                        proto::git_operation_response::error::Code::DirtyWorktree
+                    }
+                    git::operation::GitOperationErrorCode::DetachedHead => {
+                        proto::git_operation_response::error::Code::DetachedHead
+                    }
+                    git::operation::GitOperationErrorCode::Conflicts => {
+                        proto::git_operation_response::error::Code::Conflicts
+                    }
+                    git::operation::GitOperationErrorCode::InvalidRequest => {
+                        proto::git_operation_response::error::Code::InvalidRequest
+                    }
+                    git::operation::GitOperationErrorCode::ProcessFailed => {
+                        proto::git_operation_response::error::Code::ProcessFailed
+                    }
+                    git::operation::GitOperationErrorCode::UnsupportedAction => {
+                        proto::git_operation_response::error::Code::UnsupportedAction
+                    }
+                }
+                .into(),
+                message: error.message,
+                stderr: error.stderr,
+                state: error.state.as_deref().map(operation_state_to_proto),
+            }),
+        },
+    }
+}
+
+fn operation_result_from_proto(response: proto::GitOperationResponse) -> GitOperationResult {
+    if let Some(error) = response.error {
+        let code = match error.code() {
+            proto::git_operation_response::error::Code::OperationInProgress => {
+                git::operation::GitOperationErrorCode::OperationInProgress
+            }
+            proto::git_operation_response::error::Code::NoOperationInProgress => {
+                git::operation::GitOperationErrorCode::NoOperationInProgress
+            }
+            proto::git_operation_response::error::Code::DirtyWorktree => {
+                git::operation::GitOperationErrorCode::DirtyWorktree
+            }
+            proto::git_operation_response::error::Code::DetachedHead => {
+                git::operation::GitOperationErrorCode::DetachedHead
+            }
+            proto::git_operation_response::error::Code::Conflicts => {
+                git::operation::GitOperationErrorCode::Conflicts
+            }
+            proto::git_operation_response::error::Code::InvalidRequest => {
+                git::operation::GitOperationErrorCode::InvalidRequest
+            }
+            proto::git_operation_response::error::Code::ProcessFailed => {
+                git::operation::GitOperationErrorCode::ProcessFailed
+            }
+            proto::git_operation_response::error::Code::UnsupportedAction => {
+                git::operation::GitOperationErrorCode::UnsupportedAction
+            }
+        };
+        return Err(git::operation::GitOperationError {
+            code,
+            message: error.message,
+            stderr: error.stderr,
+            state: error
+                .state
+                .and_then(|state| operation_state_from_proto(state).log_err())
+                .map(Box::new),
+        });
+    }
+    match response.state {
+        Some(state) => operation_state_from_proto(state)
+            .map(git::operation::GitOperationOutcome::InProgress)
+            .map_err(|error| git::operation::GitOperationError {
+                code: git::operation::GitOperationErrorCode::ProcessFailed,
+                message: error.to_string(),
+                stderr: String::new(),
+                state: None,
+            }),
+        None if response.completed => Ok(git::operation::GitOperationOutcome::Completed),
+        None => Err(git::operation::GitOperationError {
+            code: git::operation::GitOperationErrorCode::ProcessFailed,
+            message: "remote returned an incomplete Git operation response".into(),
+            stderr: String::new(),
+            state: None,
+        }),
+    }
+}
+
+fn operation_state_from_proto(state: proto::GitOperationState) -> Result<GitOperationState> {
+    let kind = match state.kind() {
+        proto::GitOperationKind::Merge => git::operation::GitOperationKind::Merge,
+        proto::GitOperationKind::Rebase => git::operation::GitOperationKind::Rebase,
+        proto::GitOperationKind::CherryPick => git::operation::GitOperationKind::CherryPick,
+        proto::GitOperationKind::Revert => git::operation::GitOperationKind::Revert,
+    };
+    let required_input = state
+        .required_input
+        .map(|input| {
+            proto::GitOperationInput::from_i32(input)
+                .with_context(|| format!("invalid Git operation input: {input}"))
+        })
+        .transpose()?
+        .map(|input| match input {
+            proto::GitOperationInput::ResolveConflicts => {
+                git::operation::GitOperationInput::ResolveConflicts
+            }
+            proto::GitOperationInput::CommitMessage => {
+                git::operation::GitOperationInput::CommitMessage
+            }
+            proto::GitOperationInput::EditRebasePlan => {
+                git::operation::GitOperationInput::EditRebasePlan
+            }
+        });
+    Ok(GitOperationState {
+        kind,
+        progress: state
+            .progress
+            .map(|progress| git::operation::GitOperationProgress {
+                current: progress.current as usize,
+                total: progress.total as usize,
+            }),
+        conflicts: state
+            .conflicts
+            .iter()
+            .map(|path| RepoPath::from_proto(path))
+            .collect::<Result<_>>()?,
+        required_input,
+        available_actions: state
+            .available_actions
+            .into_iter()
+            .map(operation_action_from_proto)
+            .collect::<Result<_>>()?,
+        original_head: state.original_head,
+        target: state.target,
+    })
+}
+
+fn operation_action_to_proto(action: GitOperationAction) -> i32 {
+    (match action {
+        GitOperationAction::Continue => proto::GitOperationAction::Continue,
+        GitOperationAction::Skip => proto::GitOperationAction::Skip,
+        GitOperationAction::Abort => proto::GitOperationAction::Abort,
+    }) as i32
+}
+
+fn operation_action_from_proto(action: i32) -> Result<GitOperationAction> {
+    Ok(
+        match proto::GitOperationAction::from_i32(action)
+            .with_context(|| format!("invalid Git operation action: {action}"))?
+        {
+            proto::GitOperationAction::Continue => GitOperationAction::Continue,
+            proto::GitOperationAction::Skip => GitOperationAction::Skip,
+            proto::GitOperationAction::Abort => GitOperationAction::Abort,
+        },
+    )
+}
+
 fn branch_to_proto(branch: &git::repository::Branch) -> proto::Branch {
     proto::Branch {
         is_head: branch.is_head,
@@ -10169,6 +10601,82 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
+    }
+
+    #[test]
+    fn test_git_operation_proto_roundtrip_preserves_recovery_state() {
+        let state = GitOperationState {
+            kind: git::operation::GitOperationKind::Rebase,
+            progress: Some(git::operation::GitOperationProgress {
+                current: 2,
+                total: 5,
+            }),
+            conflicts: vec![repo_path("src/lib.rs")],
+            required_input: Some(git::operation::GitOperationInput::ResolveConflicts),
+            available_actions: vec![
+                GitOperationAction::Continue,
+                GitOperationAction::Skip,
+                GitOperationAction::Abort,
+            ],
+            original_head: Some("abc".into()),
+            target: Some("def".into()),
+        };
+
+        assert_eq!(
+            operation_state_from_proto(operation_state_to_proto(&state)).unwrap(),
+            state
+        );
+        let error = git::operation::GitOperationError {
+            code: git::operation::GitOperationErrorCode::Conflicts,
+            message: "conflict".into(),
+            stderr: "technical details".into(),
+            state: Some(Box::new(state)),
+        };
+        assert_eq!(
+            operation_result_from_proto(operation_result_to_proto(Err(error.clone()))),
+            Err(error)
+        );
+    }
+
+    #[test]
+    fn test_git_operation_snapshot_update_preserves_preflight_state() {
+        let mut snapshot = RepositorySnapshot::empty(
+            RepositoryId(1),
+            Path::new("/project").into(),
+            None,
+            None,
+            None,
+            PathStyle::Unix,
+        );
+        snapshot.scan_id = 7;
+        snapshot.operation = Some(GitOperationState {
+            kind: git::operation::GitOperationKind::CherryPick,
+            progress: Some(git::operation::GitOperationProgress {
+                current: 1,
+                total: 2,
+            }),
+            conflicts: vec![repo_path("src/lib.rs")],
+            required_input: Some(git::operation::GitOperationInput::ResolveConflicts),
+            available_actions: vec![
+                GitOperationAction::Continue,
+                GitOperationAction::Skip,
+                GitOperationAction::Abort,
+            ],
+            original_head: Some("abc".into()),
+            target: Some("def".into()),
+        });
+        snapshot.operation_dirty_worktree = true;
+        snapshot.operation_staged_changes = true;
+
+        let update = snapshot.initial_update(42);
+        assert_eq!(update.scan_id, 7);
+        assert!(update.operation_dirty_worktree);
+        assert!(update.operation_staged_changes);
+        assert!(!update.operation_detached_head);
+        assert_eq!(
+            operation_state_from_proto(update.operation.unwrap()).unwrap(),
+            snapshot.operation.unwrap()
+        );
     }
 
     #[gpui::test]
@@ -10688,8 +11196,17 @@ async fn compute_snapshot(
         let backend = backend.clone();
         async move { backend.worktrees().await.log_err().unwrap_or_default() }
     };
-    let (branches, head_commit, all_worktrees) =
-        futures::future::join3(branches_future, head_commit_future, worktrees_future).await;
+    let operation_preflight_future = {
+        let backend = backend.clone();
+        async move { backend.operation_preflight().await.log_err() }
+    };
+    let (branches, head_commit, all_worktrees, operation_preflight) = futures::future::join4(
+        branches_future,
+        head_commit_future,
+        worktrees_future,
+        operation_preflight_future,
+    )
+    .await;
     log::debug!("fetched branches, head commit, worktrees");
 
     let BranchesScanResult {
@@ -10707,6 +11224,18 @@ async fn compute_snapshot(
     let mut remote_urls = backend.remote_urls().await;
     let remote_origin_url = remote_urls.remove("origin");
     let remote_upstream_url = remote_urls.remove("upstream");
+    let operation = operation_preflight
+        .as_ref()
+        .and_then(|preflight| preflight.operation.clone());
+    let operation_dirty_worktree = operation_preflight
+        .as_ref()
+        .is_some_and(|preflight| preflight.dirty_worktree);
+    let operation_staged_changes = operation_preflight
+        .as_ref()
+        .is_some_and(|preflight| preflight.staged_changes);
+    let operation_detached_head = operation_preflight
+        .as_ref()
+        .is_some_and(|preflight| preflight.detached_head);
 
     log::debug!("fetched remotes");
 
@@ -10716,6 +11245,10 @@ async fn compute_snapshot(
         let branch_list_changed = *branch_list != *this.snapshot.branch_list;
         let branch_list_error_changed = branch_list_error != this.snapshot.branch_list_error;
         let worktrees_changed = *linked_worktrees != *this.snapshot.linked_worktrees;
+        let operation_changed = operation != this.snapshot.operation
+            || operation_dirty_worktree != this.snapshot.operation_dirty_worktree
+            || operation_staged_changes != this.snapshot.operation_staged_changes
+            || operation_detached_head != this.snapshot.operation_detached_head;
 
         this.snapshot = RepositorySnapshot {
             id,
@@ -10727,6 +11260,10 @@ async fn compute_snapshot(
             remote_origin_url,
             remote_upstream_url,
             linked_worktrees,
+            operation,
+            operation_dirty_worktree,
+            operation_staged_changes,
+            operation_detached_head,
             scan_id: prev_snapshot.scan_id + 1,
             ..prev_snapshot
         };
@@ -10741,6 +11278,9 @@ async fn compute_snapshot(
 
         if worktrees_changed {
             cx.emit(RepositoryEvent::GitWorktreeListChanged);
+        }
+        if operation_changed {
+            cx.emit(RepositoryEvent::OperationStateChanged);
         }
 
         this.snapshot.clone()

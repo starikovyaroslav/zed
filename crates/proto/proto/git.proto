@@ -137,6 +137,99 @@ message UpdateRepository {
   optional string repository_dir_abs_path = 19;
   optional string common_dir_abs_path = 20;
   optional string branch_list_error = 21;
+  optional GitOperationState operation = 22;
+  bool operation_dirty_worktree = 23;
+  bool operation_staged_changes = 24;
+  bool operation_detached_head = 25;
+}
+
+enum GitOperationKind {
+  MERGE = 0;
+  REBASE = 1;
+  CHERRY_PICK = 2;
+  REVERT = 3;
+}
+
+enum GitOperationAction {
+  CONTINUE = 0;
+  SKIP = 1;
+  ABORT = 2;
+}
+
+enum GitOperationInput {
+  RESOLVE_CONFLICTS = 0;
+  COMMIT_MESSAGE = 1;
+  EDIT_REBASE_PLAN = 2;
+}
+
+message GitOperationProgress {
+  uint64 current = 1;
+  uint64 total = 2;
+}
+
+message GitOperationState {
+  GitOperationKind kind = 1;
+  optional GitOperationProgress progress = 2;
+  repeated string conflicts = 3;
+  optional GitOperationInput required_input = 4;
+  repeated GitOperationAction available_actions = 5;
+  optional string original_head = 6;
+  optional string target = 7;
+}
+
+message GitOperationRequest {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  oneof operation {
+    Merge merge = 3;
+    Rebase rebase = 4;
+    CherryPick cherry_pick = 5;
+    Revert revert = 6;
+  }
+
+  message Merge {
+    string commit = 1;
+    bool no_commit = 2;
+  }
+  message Rebase {
+    string upstream = 1;
+  }
+  message CherryPick {
+    repeated string commits = 1;
+  }
+  message Revert {
+    repeated string commits = 1;
+    bool no_commit = 2;
+  }
+}
+
+message GitOperationActionRequest {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  GitOperationAction action = 3;
+}
+
+message GitOperationResponse {
+  bool completed = 1;
+  optional GitOperationState state = 2;
+  optional Error error = 3;
+
+  message Error {
+    enum Code {
+      OPERATION_IN_PROGRESS = 0;
+      NO_OPERATION_IN_PROGRESS = 1;
+      DIRTY_WORKTREE = 2;
+      DETACHED_HEAD = 3;
+      CONFLICTS = 4;
+      INVALID_REQUEST = 5;
+      PROCESS_FAILED = 6;
+      UNSUPPORTED_ACTION = 7;
+    }
+    Code code = 1;
+    string message = 2;
+    string stderr = 3;
+    optional GitOperationState state = 4;
+  }
 }
 
 message RemoveRepository {

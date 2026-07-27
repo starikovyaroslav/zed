@@ -883,6 +883,10 @@ impl Database {
                     }
                 } else {
                     repositories.push(proto::UpdateRepository {
+                        operation: None,
+                        operation_dirty_worktree: false,
+                        operation_staged_changes: false,
+                        operation_detached_head: false,
                         project_id: db_repository_entry.project_id.0 as u64,
                         id: db_repository_entry.id as u64,
                         abs_path: db_repository_entry.abs_path.clone(),

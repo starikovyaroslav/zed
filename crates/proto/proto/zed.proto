@@ -505,7 +505,10 @@ message Envelope {
     RefreshDocumentColors refresh_document_colors = 474;
     RefreshDocumentLinks refresh_document_links = 475;
     RefreshFoldingRanges refresh_folding_ranges = 476;
-    RefreshDocumentSymbols refresh_document_symbols = 477; // current max
+    RefreshDocumentSymbols refresh_document_symbols = 477;
+    GitOperationRequest git_operation_request = 478;
+    GitOperationActionRequest git_operation_action_request = 479;
+    GitOperationResponse git_operation_response = 480; // current max
   }
 
   reserved 87 to 88;

@@ -784,6 +784,10 @@ impl Database {
                         }
                     } else {
                         updated_repositories.push(proto::UpdateRepository {
+                            operation: None,
+                            operation_dirty_worktree: false,
+                            operation_staged_changes: false,
+                            operation_detached_head: false,
                             entry_ids,
                             updated_statuses,
                             removed_statuses,
