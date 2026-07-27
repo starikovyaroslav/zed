@@ -216,3 +216,220 @@ An issue is complete only when:
 * final Russian report is provided to the owner.
 
 If any requirement remains incomplete, clearly say that the issue is only partially implemented.
+
+## Project context
+
+This repository is a fork of `zed-industries/zed`.
+
+* Fork: `starikovyaroslav/zed`
+* Upstream: `zed-industries/zed`
+* Main project epic: GitHub issue #1
+* Work must be performed through the child issues linked from issue #1.
+
+The goal is to build a native, editor-integrated advanced Git workflow for Zed comparable in completeness to JetBrains/WebStorm while preserving Zed's architecture, UX conventions and performance characteristics.
+
+## Language
+
+All reports intended for the repository owner must be written in Russian.
+
+This includes:
+
+* task progress summaries;
+* final implementation reports;
+* explanations of architectural decisions;
+* descriptions of blockers;
+* test results communicated to the owner.
+
+Code, identifiers, commit messages, branch names, pull request titles and technical GitHub issue comments should remain in English unless Russian is explicitly required.
+
+## Issue workflow
+
+Work on only one implementation issue at a time unless the issue explicitly requires a coordinated change.
+
+Before starting an issue:
+
+1. Read the parent epic #1.
+2. Read the selected child issue completely.
+3. Read all issue comments.
+4. Inspect related upstream issues, pull requests and current code.
+5. Verify that the requested functionality has not already been implemented.
+6. Review the dependencies listed in the issue.
+7. Inspect `main`, the current working tree and existing open pull requests.
+8. Post a short English comment in the issue stating that work has started and naming the planned branch.
+
+Do not mark an issue completed merely because a prototype exists.
+
+## Branches
+
+Create a dedicated branch for every issue.
+
+Use:
+
+```text
+feat/issue-<number>-<short-description>
+fix/issue-<number>-<short-description>
+refactor/issue-<number>-<short-description>
+```
+
+Examples:
+
+```text
+feat/issue-2-git-operation-state
+feat/issue-4-multi-cherry-pick
+feat/issue-8-interactive-rebase
+```
+
+Always branch from the latest appropriate base branch.
+
+Before creating a branch:
+
+```bash
+git fetch origin
+git fetch upstream
+git status
+```
+
+Do not commit unrelated local changes.
+
+## Commits
+
+Create meaningful, focused commits.
+
+Commit messages must be in English and use an issue reference:
+
+```text
+feat(git): add recoverable operation state (#2)
+test(git): cover interrupted cherry-pick recovery (#2)
+docs(git): document operation recovery workflow (#2)
+```
+
+Do not create one giant final commit when the implementation naturally consists of multiple coherent changes.
+
+Do not create commits that contain:
+
+* temporary debugging output;
+* generated build artifacts;
+* unrelated formatting;
+* secrets;
+* credentials;
+* local environment files.
+
+## Implementation requirements
+
+Before editing code:
+
+1. Investigate the current repository architecture.
+2. Identify actual crates, modules, types and conventions.
+3. Search for related work in the current branch and upstream repository.
+4. Create a concrete implementation plan.
+5. Then proceed directly to implementation.
+
+Do not stop after writing a plan.
+
+Do not:
+
+* invent APIs without checking the repository;
+* create a parallel Git subsystem;
+* place raw Git command construction inside UI components;
+* implement only a visual mock;
+* leave critical functionality as TODO;
+* declare completion while tests fail;
+* silently remove or weaken existing behavior;
+* bypass existing Zed abstractions without a documented reason.
+
+Related architectural refactoring is allowed when necessary for a complete and maintainable solution.
+
+## GitHub issue updates
+
+Use `gh` to communicate progress.
+
+At the start, add a short comment containing:
+
+* branch name;
+* implementation scope;
+* important dependencies or discovered overlap.
+
+During implementation, comment only when there is a meaningful event:
+
+* architecture materially differs from the original issue;
+* an upstream implementation overlaps with the task;
+* an external blocker is discovered;
+* the issue scope must be split;
+* a partial PR is intentionally created.
+
+Do not spam the issue with low-level progress updates.
+
+At completion, add a detailed English issue comment containing:
+
+* what was implemented;
+* architecture summary;
+* key files and components;
+* tests executed;
+* test results;
+* known limitations;
+* pull request link.
+
+The private/user-facing summary in Codex must contain the same information in Russian.
+
+## Pull requests
+
+For each completed issue:
+
+1. Ensure the branch is pushed to `origin`.
+2. Open a pull request against `starikovyaroslav/zed`.
+3. Use a clear English title.
+4. Include `Closes #<issue>` only when the issue Definition of Done is completely satisfied.
+5. Otherwise use `Related to #<issue>`.
+6. Include implementation summary, architecture, tests, screenshots where relevant and known limitations.
+7. Keep the PR in draft state until the implementation is ready for review.
+
+Never open a pull request against `zed-industries/zed` without explicit owner approval.
+
+Do not merge pull requests automatically unless explicitly instructed.
+
+## Verification
+
+Run the most relevant checks supported by the repository.
+
+At minimum:
+
+* formatting for affected Rust code;
+* targeted tests;
+* compilation or checks for affected crates;
+* applicable UI tests;
+* existing Git-related regression tests.
+
+If a complete test suite is impractical, run focused checks and explicitly state what was not run and why.
+
+Do not claim that a test passed unless it was actually executed successfully.
+
+## Destructive operations
+
+Do not:
+
+* force-push shared branches;
+* rewrite `main`;
+* delete branches;
+* close issues;
+* merge pull requests;
+* modify upstream remotes;
+* discard user changes;
+
+unless the owner explicitly requested that exact action.
+
+Force-push is allowed only on the agent's dedicated issue branch when necessary after a rebase and must use `--force-with-lease`.
+
+## Completion criteria
+
+An issue is complete only when:
+
+* its Definition of Done is satisfied;
+* implementation is not a mock or prototype;
+* relevant tests pass;
+* code is committed;
+* branch is pushed;
+* draft or ready PR is created;
+* issue contains a completion comment;
+* final Russian report is provided to the owner.
+
+If any requirement remains incomplete, clearly say that the issue is only partially implemented.
