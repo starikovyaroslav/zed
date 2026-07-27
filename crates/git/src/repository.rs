@@ -749,6 +749,56 @@ pub fn delete_branch_flag(is_remote_tracking_ref: bool, force: bool) -> &'static
 }
 
 pub trait GitRepository: Send + Sync {
+    fn operation_preflight(
+        &self,
+    ) -> BoxFuture<'_, Result<crate::operation::GitOperationPreflight>> {
+        async {
+            Ok(crate::operation::GitOperationPreflight {
+                dirty_worktree: false,
+                staged_changes: false,
+                detached_head: false,
+                operation: None,
+            })
+        }
+        .boxed()
+    }
+
+    fn operation_state(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<crate::operation::GitOperationState>>> {
+        async { Ok(None) }.boxed()
+    }
+
+    fn start_operation(
+        &self,
+        _operation: crate::operation::GitOperation,
+    ) -> BoxFuture<'_, crate::operation::GitOperationResult> {
+        async {
+            Err(operation_error(
+                crate::operation::GitOperationErrorCode::InvalidRequest,
+                "advanced Git operations are not supported by this repository backend".into(),
+                String::new(),
+                None,
+            ))
+        }
+        .boxed()
+    }
+
+    fn apply_operation_action(
+        &self,
+        _action: crate::operation::GitOperationAction,
+    ) -> BoxFuture<'_, crate::operation::GitOperationResult> {
+        async {
+            Err(operation_error(
+                crate::operation::GitOperationErrorCode::InvalidRequest,
+                "advanced Git operations are not supported by this repository backend".into(),
+                String::new(),
+                None,
+            ))
+        }
+        .boxed()
+    }
+
     /// Returns the contents of an entry in the repository's index, or None if there is no entry for the given path.
     ///
     /// Also returns `None` for symlinks.
@@ -1122,6 +1172,297 @@ pub struct RealGitRepository {
     is_trusted: Arc<AtomicBool>,
 }
 
+fn operation_error(
+    code: crate::operation::GitOperationErrorCode,
+    message: String,
+    stderr: String,
+    state: Option<crate::operation::GitOperationState>,
+) -> crate::operation::GitOperationError {
+    crate::operation::GitOperationError {
+        code,
+        message,
+        stderr,
+        state: state.map(Box::new),
+    }
+}
+
+fn operation_args(
+    operation: &crate::operation::GitOperation,
+) -> Result<Vec<OsString>, crate::operation::GitOperationError> {
+    use crate::operation::GitOperation;
+    let mut args = Vec::new();
+    match operation {
+        GitOperation::Merge { commit, no_commit } => {
+            if commit.is_empty() {
+                return Err(operation_error(
+                    crate::operation::GitOperationErrorCode::InvalidRequest,
+                    "merge target must not be empty".into(),
+                    String::new(),
+                    None,
+                ));
+            }
+            args.extend(["merge".into(), "--no-edit".into()]);
+            if *no_commit {
+                args.push("--no-commit".into());
+            }
+            args.push(commit.into());
+        }
+        GitOperation::Rebase { upstream } => {
+            if upstream.is_empty() {
+                return Err(operation_error(
+                    crate::operation::GitOperationErrorCode::InvalidRequest,
+                    "rebase upstream must not be empty".into(),
+                    String::new(),
+                    None,
+                ));
+            }
+            args.extend(["rebase".into(), upstream.into()]);
+        }
+        GitOperation::CherryPick { commits } | GitOperation::Revert { commits, .. }
+            if commits.is_empty() =>
+        {
+            return Err(operation_error(
+                crate::operation::GitOperationErrorCode::InvalidRequest,
+                "operation requires at least one commit".into(),
+                String::new(),
+                None,
+            ));
+        }
+        GitOperation::CherryPick { commits } => {
+            args.push("cherry-pick".into());
+            args.extend(commits.iter().map(OsString::from));
+        }
+        GitOperation::Revert { commits, no_commit } => {
+            args.extend(["revert".into(), "--no-edit".into()]);
+            if *no_commit {
+                args.push("--no-commit".into());
+            }
+            args.extend(commits.iter().map(OsString::from));
+        }
+    }
+    Ok(args)
+}
+
+fn action_args(
+    kind: crate::operation::GitOperationKind,
+    action: crate::operation::GitOperationAction,
+) -> Vec<OsString> {
+    use crate::operation::{GitOperationAction as Action, GitOperationKind as Kind};
+    match (kind, action) {
+        (Kind::Merge, Action::Continue) => vec!["commit".into(), "--no-edit".into()],
+        (Kind::Merge, Action::Abort) => vec!["merge".into(), "--abort".into()],
+        (Kind::Rebase, action) => vec!["rebase".into(), action_flag(action).into()],
+        (Kind::CherryPick, action) => vec!["cherry-pick".into(), action_flag(action).into()],
+        (Kind::Revert, action) => vec!["revert".into(), action_flag(action).into()],
+        (Kind::Merge, Action::Skip) => unreachable!("merge skip is not exposed"),
+    }
+}
+
+fn action_flag(action: crate::operation::GitOperationAction) -> &'static str {
+    match action {
+        crate::operation::GitOperationAction::Continue => "--continue",
+        crate::operation::GitOperationAction::Skip => "--skip",
+        crate::operation::GitOperationAction::Abort => "--abort",
+    }
+}
+
+async fn run_operation_command(
+    git_dir: &Path,
+    git: &GitBinary,
+    args: Vec<OsString>,
+) -> crate::operation::GitOperationResult {
+    let output = match git.build_command(&args).output().await {
+        Ok(output) => output,
+        Err(error) => {
+            return Err(operation_error(
+                crate::operation::GitOperationErrorCode::ProcessFailed,
+                error.to_string(),
+                String::new(),
+                detect_operation_state(git_dir, git).await.ok().flatten(),
+            ));
+        }
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let state = detect_operation_state(git_dir, git).await.ok().flatten();
+    if output.status.success() {
+        return Ok(match state {
+            Some(state) => crate::operation::GitOperationOutcome::InProgress(state),
+            None => crate::operation::GitOperationOutcome::Completed,
+        });
+    }
+
+    let lower = stderr.to_ascii_lowercase();
+    let code = if state
+        .as_ref()
+        .is_some_and(|state| !state.conflicts.is_empty())
+        || lower.contains("conflict")
+    {
+        crate::operation::GitOperationErrorCode::Conflicts
+    } else if lower.contains("local changes") || lower.contains("would be overwritten") {
+        crate::operation::GitOperationErrorCode::DirtyWorktree
+    } else if lower.contains("detached head") {
+        crate::operation::GitOperationErrorCode::DetachedHead
+    } else {
+        crate::operation::GitOperationErrorCode::ProcessFailed
+    };
+    Err(operation_error(
+        code,
+        format!("Git operation failed with {}", output.status),
+        stderr,
+        state,
+    ))
+}
+
+async fn operation_preflight(
+    git_dir: &Path,
+    git: &GitBinary,
+) -> Result<crate::operation::GitOperationPreflight> {
+    let status = git.run_raw(&["status", "--porcelain=v1", "-z"]).await?;
+    let mut dirty_worktree = false;
+    let mut staged_changes = false;
+    for entry in status.split('\0').filter(|entry| !entry.is_empty()) {
+        let bytes = entry.as_bytes();
+        if bytes.len() < 2 {
+            continue;
+        }
+        staged_changes |= bytes[0] != b' ' && bytes[0] != b'?';
+        dirty_worktree |= bytes[1] != b' ' || bytes[0] == b'?';
+    }
+    let detached_head = !git
+        .build_command(&["symbolic-ref", "--quiet", "HEAD"])
+        .output()
+        .await?
+        .status
+        .success();
+    Ok(crate::operation::GitOperationPreflight {
+        dirty_worktree,
+        staged_changes,
+        detached_head,
+        operation: detect_operation_state(git_dir, git).await?,
+    })
+}
+
+async fn detect_operation_state(
+    git_dir: &Path,
+    git: &GitBinary,
+) -> Result<Option<crate::operation::GitOperationState>> {
+    use crate::operation::{
+        GitOperationAction as Action, GitOperationInput as Input, GitOperationKind as Kind,
+        GitOperationState,
+    };
+
+    let rebase_merge = git_dir.join(crate::REBASE_MERGE_DIR);
+    let rebase_apply = git_dir.join(crate::REBASE_APPLY_DIR);
+    let kind = if rebase_merge.is_dir() || rebase_apply.is_dir() {
+        Some(Kind::Rebase)
+    } else if git_dir.join("CHERRY_PICK_HEAD").exists() {
+        Some(Kind::CherryPick)
+    } else if git_dir.join("REVERT_HEAD").exists() {
+        Some(Kind::Revert)
+    } else if git_dir.join("MERGE_HEAD").exists() {
+        Some(Kind::Merge)
+    } else {
+        sequencer_kind(git_dir)
+    };
+    let Some(kind) = kind else {
+        return Ok(None);
+    };
+
+    let status = git.run_raw(&["status", "--porcelain=v1", "-z"]).await?;
+    let conflicts = status
+        .split('\0')
+        .filter_map(|entry| {
+            let code = entry.get(..2)?;
+            matches!(code, "DD" | "AU" | "UD" | "UA" | "DU" | "AA" | "UU")
+                .then(|| RepoPath::new(entry.get(3..)?).ok())
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    let progress = if kind == Kind::Rebase {
+        let dir = if rebase_merge.is_dir() {
+            &rebase_merge
+        } else {
+            &rebase_apply
+        };
+        read_progress(dir, "msgnum", "end").or_else(|| read_progress(dir, "next", "last"))
+    } else {
+        sequencer_progress(git_dir)
+    };
+    let original_head = read_trimmed(git_dir.join("ORIG_HEAD"));
+    let target = match kind {
+        Kind::Merge => read_trimmed(git_dir.join("MERGE_HEAD")),
+        Kind::CherryPick => read_trimmed(git_dir.join("CHERRY_PICK_HEAD")),
+        Kind::Revert => read_trimmed(git_dir.join("REVERT_HEAD")),
+        Kind::Rebase => read_trimmed(rebase_merge.join("onto"))
+            .or_else(|| read_trimmed(rebase_apply.join("onto"))),
+    };
+    let available_actions = match kind {
+        Kind::Merge => vec![Action::Continue, Action::Abort],
+        _ => vec![Action::Continue, Action::Skip, Action::Abort],
+    };
+    let required_input = if !conflicts.is_empty() {
+        Some(Input::ResolveConflicts)
+    } else if kind == Kind::Rebase && rebase_merge.join("interactive").exists() {
+        Some(Input::EditRebasePlan)
+    } else {
+        Some(Input::CommitMessage)
+    };
+
+    Ok(Some(GitOperationState {
+        kind,
+        progress,
+        conflicts,
+        required_input,
+        available_actions,
+        original_head,
+        target,
+    }))
+}
+
+fn read_trimmed(path: PathBuf) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn read_progress(
+    directory: &Path,
+    current_name: &str,
+    total_name: &str,
+) -> Option<crate::operation::GitOperationProgress> {
+    let current = read_trimmed(directory.join(current_name))?.parse().ok()?;
+    let total = read_trimmed(directory.join(total_name))?.parse().ok()?;
+    Some(crate::operation::GitOperationProgress { current, total })
+}
+
+fn sequencer_kind(git_dir: &Path) -> Option<crate::operation::GitOperationKind> {
+    let todo = read_trimmed(git_dir.join(crate::SEQUENCER_DIR).join("todo"))?;
+    match todo.split_whitespace().next()? {
+        "pick" => Some(crate::operation::GitOperationKind::CherryPick),
+        "revert" => Some(crate::operation::GitOperationKind::Revert),
+        _ => None,
+    }
+}
+
+fn sequencer_progress(git_dir: &Path) -> Option<crate::operation::GitOperationProgress> {
+    let sequencer = git_dir.join(crate::SEQUENCER_DIR);
+    let remaining = std::fs::read_to_string(sequencer.join("todo"))
+        .ok()?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    let done = std::fs::read_to_string(sequencer.join("done"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    Some(crate::operation::GitOperationProgress {
+        current: done.saturating_add(1),
+        total: done + remaining,
+    })
+}
+
 #[derive(Debug)]
 pub enum RefEdit {
     Update { ref_name: String, commit: String },
@@ -1330,6 +1671,140 @@ pub async fn get_git_committer(cx: &AsyncApp) -> GitCommitter {
 }
 
 impl GitRepository for RealGitRepository {
+    fn operation_preflight(
+        &self,
+    ) -> BoxFuture<'_, Result<crate::operation::GitOperationPreflight>> {
+        let git_dir = self.git_dir.clone();
+        let git = self.git_binary_in_worktree();
+        self.executor
+            .spawn(async move {
+                let git = git?;
+                operation_preflight(&git_dir, &git).await
+            })
+            .boxed()
+    }
+
+    fn operation_state(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<crate::operation::GitOperationState>>> {
+        let git_dir = self.git_dir.clone();
+        let git = self.git_binary_in_worktree();
+        self.executor
+            .spawn(async move {
+                let git = git?;
+                detect_operation_state(&git_dir, &git).await
+            })
+            .boxed()
+    }
+
+    fn start_operation(
+        &self,
+        operation: crate::operation::GitOperation,
+    ) -> BoxFuture<'_, crate::operation::GitOperationResult> {
+        let git_dir = self.git_dir.clone();
+        let git = self.git_binary_in_worktree();
+        self.executor
+            .spawn(async move {
+                let git = git.map_err(|error| {
+                    operation_error(
+                        crate::operation::GitOperationErrorCode::InvalidRequest,
+                        error.to_string(),
+                        String::new(),
+                        None,
+                    )
+                })?;
+                if let Some(state) =
+                    detect_operation_state(&git_dir, &git)
+                        .await
+                        .map_err(|error| {
+                            operation_error(
+                                crate::operation::GitOperationErrorCode::ProcessFailed,
+                                error.to_string(),
+                                String::new(),
+                                None,
+                            )
+                        })?
+                {
+                    return Err(operation_error(
+                        crate::operation::GitOperationErrorCode::OperationInProgress,
+                        format!("a {} operation is already in progress", state.kind),
+                        String::new(),
+                        Some(state),
+                    ));
+                }
+                let preflight = operation_preflight(&git_dir, &git).await.map_err(|error| {
+                    operation_error(
+                        crate::operation::GitOperationErrorCode::ProcessFailed,
+                        error.to_string(),
+                        String::new(),
+                        None,
+                    )
+                })?;
+                if preflight.detached_head {
+                    return Err(operation_error(
+                        crate::operation::GitOperationErrorCode::DetachedHead,
+                        "cannot start this operation while HEAD is detached".into(),
+                        String::new(),
+                        None,
+                    ));
+                }
+
+                let args = operation_args(&operation)?;
+                run_operation_command(&git_dir, &git, args).await
+            })
+            .boxed()
+    }
+
+    fn apply_operation_action(
+        &self,
+        action: crate::operation::GitOperationAction,
+    ) -> BoxFuture<'_, crate::operation::GitOperationResult> {
+        let git_dir = self.git_dir.clone();
+        let git = self.git_binary_in_worktree();
+        self.executor
+            .spawn(async move {
+                let git = git.map_err(|error| {
+                    operation_error(
+                        crate::operation::GitOperationErrorCode::InvalidRequest,
+                        error.to_string(),
+                        String::new(),
+                        None,
+                    )
+                })?;
+                let Some(state) =
+                    detect_operation_state(&git_dir, &git)
+                        .await
+                        .map_err(|error| {
+                            operation_error(
+                                crate::operation::GitOperationErrorCode::ProcessFailed,
+                                error.to_string(),
+                                String::new(),
+                                None,
+                            )
+                        })?
+                else {
+                    return Err(operation_error(
+                        crate::operation::GitOperationErrorCode::NoOperationInProgress,
+                        "no recoverable Git operation is in progress".into(),
+                        String::new(),
+                        None,
+                    ));
+                };
+
+                if !state.available_actions.contains(&action) {
+                    return Err(operation_error(
+                        crate::operation::GitOperationErrorCode::UnsupportedAction,
+                        format!("{action:?} is not supported for {}", state.kind),
+                        String::new(),
+                        Some(state),
+                    ));
+                }
+                let args = action_args(state.kind, action);
+                run_operation_command(&git_dir, &git, args).await
+            })
+            .boxed()
+    }
+
     fn path(&self) -> PathBuf {
         self.git_dir.clone()
     }
@@ -4083,6 +4558,328 @@ mod tests {
             original_repo_path_from_common_dir(&repository.common_dir).unwrap(),
             repo_dir.path(),
         );
+    }
+
+    fn conflicted_cherry_pick_repository(
+        cx: &mut TestAppContext,
+    ) -> (tempfile::TempDir, RealGitRepository, String) {
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        git_command(repo_dir.path(), ["config", "user.name", "test"]);
+        git_command(repo_dir.path(), ["config", "user.email", "test@zed.dev"]);
+        fs::write(repo_dir.path().join("file.txt"), "base\n").unwrap();
+        git_command(repo_dir.path(), ["add", "file.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "base"]);
+        git_command(repo_dir.path(), ["switch", "-c", "feature"]);
+        fs::write(repo_dir.path().join("file.txt"), "feature\n").unwrap();
+        git_command(repo_dir.path(), ["commit", "-am", "feature"]);
+        let feature = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]);
+        git_command(repo_dir.path(), ["switch", "main"]);
+        fs::write(repo_dir.path().join("file.txt"), "main\n").unwrap();
+        git_command(repo_dir.path(), ["commit", "-am", "main"]);
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        (repo_dir, repository, feature)
+    }
+
+    #[gpui::test]
+    async fn test_operation_state_is_restored_and_abortable(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let (_repo_dir, repository, feature) = conflicted_cherry_pick_repository(cx);
+
+        let result = repository
+            .start_operation(crate::operation::GitOperation::CherryPick {
+                commits: vec![feature],
+            })
+            .await;
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.code,
+            crate::operation::GitOperationErrorCode::Conflicts
+        );
+        let state = repository.operation_state().await.unwrap().unwrap();
+        assert_eq!(state.kind, crate::operation::GitOperationKind::CherryPick);
+        assert_eq!(state.conflicts, [repo_path("file.txt")]);
+
+        let reopened =
+            RealGitRepository::new(&repository.git_dir, None, Some("git".into()), cx.executor())
+                .unwrap();
+        assert_eq!(reopened.operation_state().await.unwrap(), Some(state));
+        assert_eq!(
+            reopened
+                .apply_operation_action(crate::operation::GitOperationAction::Abort)
+                .await
+                .unwrap(),
+            crate::operation::GitOperationOutcome::Completed
+        );
+        assert_eq!(reopened.operation_state().await.unwrap(), None);
+    }
+
+    #[gpui::test]
+    async fn test_operation_prevents_overlapping_sequencers(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let (_repo_dir, repository, feature) = conflicted_cherry_pick_repository(cx);
+        repository
+            .start_operation(crate::operation::GitOperation::CherryPick {
+                commits: vec![feature.clone()],
+            })
+            .await
+            .unwrap_err();
+
+        let error = repository
+            .start_operation(crate::operation::GitOperation::Revert {
+                commits: vec![feature],
+                no_commit: false,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            crate::operation::GitOperationErrorCode::OperationInProgress
+        );
+        repository
+            .apply_operation_action(crate::operation::GitOperationAction::Abort)
+            .await
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_operation_process_failure_preserves_stderr(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        let error = repository
+            .start_operation(crate::operation::GitOperation::Merge {
+                commit: "missing-operation-target".into(),
+                no_commit: false,
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.code,
+            crate::operation::GitOperationErrorCode::ProcessFailed
+        );
+        assert!(!error.stderr.is_empty());
+        assert!(error.state.is_none());
+    }
+
+    #[gpui::test]
+    async fn test_operation_invalid_recovery_action_is_structured(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        let error = repository
+            .apply_operation_action(crate::operation::GitOperationAction::Continue)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            crate::operation::GitOperationErrorCode::NoOperationInProgress
+        );
+        assert!(error.stderr.is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_operation_continue_and_skip(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let (repo_dir, repository, feature) = conflicted_cherry_pick_repository(cx);
+        repository
+            .start_operation(crate::operation::GitOperation::CherryPick {
+                commits: vec![feature],
+            })
+            .await
+            .unwrap_err();
+        fs::write(repo_dir.path().join("file.txt"), "resolved\n").unwrap();
+        git_command(repo_dir.path(), ["add", "file.txt"]);
+        assert_eq!(
+            repository
+                .apply_operation_action(crate::operation::GitOperationAction::Continue)
+                .await
+                .unwrap(),
+            crate::operation::GitOperationOutcome::Completed
+        );
+
+        let (_repo_dir, repository, feature) = conflicted_cherry_pick_repository(cx);
+        repository
+            .start_operation(crate::operation::GitOperation::CherryPick {
+                commits: vec![feature],
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            repository
+                .apply_operation_action(crate::operation::GitOperationAction::Skip)
+                .await
+                .unwrap(),
+            crate::operation::GitOperationOutcome::Completed
+        );
+    }
+
+    #[gpui::test]
+    async fn test_operation_preflight_detects_worktree_index_and_detached_head(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("file.txt"), "base\n").unwrap();
+        git_command(repo_dir.path(), ["add", "file.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "base"]);
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        fs::write(repo_dir.path().join("file.txt"), "dirty\n").unwrap();
+        let preflight = repository.operation_preflight().await.unwrap();
+        assert!(preflight.dirty_worktree);
+        assert!(!preflight.staged_changes);
+        assert!(!preflight.detached_head);
+
+        git_command(repo_dir.path(), ["add", "file.txt"]);
+        let preflight = repository.operation_preflight().await.unwrap();
+        assert!(!preflight.dirty_worktree);
+        assert!(preflight.staged_changes);
+
+        git_command(repo_dir.path(), ["commit", "-m", "staged"]);
+        git_command(repo_dir.path(), ["checkout", "--detach"]);
+        let preflight = repository.operation_preflight().await.unwrap();
+        assert!(preflight.detached_head);
+        let error = repository
+            .start_operation(crate::operation::GitOperation::Revert {
+                commits: vec!["HEAD".into()],
+                no_commit: false,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            crate::operation::GitOperationErrorCode::DetachedHead
+        );
+    }
+
+    #[gpui::test]
+    async fn test_merge_and_rebase_states_are_detected(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let (_repo_dir, repository, _feature) = conflicted_cherry_pick_repository(cx);
+        let error = repository
+            .start_operation(crate::operation::GitOperation::Merge {
+                commit: "feature".into(),
+                no_commit: false,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            crate::operation::GitOperationErrorCode::Conflicts
+        );
+        assert_eq!(
+            error.state.unwrap().kind,
+            crate::operation::GitOperationKind::Merge
+        );
+        repository
+            .apply_operation_action(crate::operation::GitOperationAction::Abort)
+            .await
+            .unwrap();
+
+        let (repo_dir, repository, _feature) = conflicted_cherry_pick_repository(cx);
+        git_command(repo_dir.path(), ["switch", "feature"]);
+        let error = repository
+            .start_operation(crate::operation::GitOperation::Rebase {
+                upstream: "main".into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            crate::operation::GitOperationErrorCode::Conflicts
+        );
+        let state = error.state.unwrap();
+        assert_eq!(state.kind, crate::operation::GitOperationKind::Rebase);
+        assert!(state.progress.is_some());
+        repository
+            .apply_operation_action(crate::operation::GitOperationAction::Abort)
+            .await
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_revert_state_is_detected(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        git_command(repo_dir.path(), ["config", "user.name", "test"]);
+        git_command(repo_dir.path(), ["config", "user.email", "test@zed.dev"]);
+        fs::write(repo_dir.path().join("file.txt"), "base\n").unwrap();
+        git_command(repo_dir.path(), ["add", "file.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "base"]);
+        fs::write(repo_dir.path().join("file.txt"), "first\n").unwrap();
+        git_command(repo_dir.path(), ["commit", "-am", "first"]);
+        let first = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]);
+        fs::write(repo_dir.path().join("file.txt"), "second\n").unwrap();
+        git_command(repo_dir.path(), ["commit", "-am", "second"]);
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        let error = repository
+            .start_operation(crate::operation::GitOperation::Revert {
+                commits: vec![first],
+                no_commit: false,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            crate::operation::GitOperationErrorCode::Conflicts
+        );
+        assert_eq!(
+            error.state.unwrap().kind,
+            crate::operation::GitOperationKind::Revert
+        );
+        repository
+            .apply_operation_action(crate::operation::GitOperationAction::Abort)
+            .await
+            .unwrap();
     }
 
     #[gpui::test]
