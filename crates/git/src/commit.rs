@@ -171,6 +171,7 @@ pub(crate) struct CommitDiffObject<'a> {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CommitDiffEntry<'a> {
     pub path: &'a str,
+    pub old_path: Option<&'a str>,
     pub status: StatusCode,
     pub old_object: Option<CommitDiffObject<'a>>,
     pub new_object: Option<CommitDiffObject<'a>>,
@@ -187,12 +188,54 @@ pub(crate) fn parse_git_diff_raw(
             return None;
         }
 
-        let path = match parts.next() {
+        let first_path = match parts.next() {
             Some(path) => path,
             None => return Some(Err(anyhow::anyhow!("raw diff is missing the path"))),
         };
-        Some(parse_git_diff_raw_entry(metadata, path))
+        let parsed = parse_git_diff_raw_entry(metadata, first_path);
+        Some(parsed.and_then(|mut entry| {
+            if matches!(entry.status, StatusCode::Renamed | StatusCode::Copied) {
+                entry.old_path = Some(first_path);
+                entry.path = parts
+                    .next()
+                    .context("raw rename/copy diff is missing the destination path")?;
+            }
+            Ok(entry)
+        }))
     })
+}
+
+/// Parses `git diff --numstat -z` output, keyed by destination path.
+pub(crate) fn parse_numstat_z(content: &str) -> HashMap<String, (u32, u32)> {
+    let mut parts = content.split('\0');
+    let mut result = HashMap::default();
+
+    while let Some(record) = parts.next() {
+        if record.is_empty() {
+            continue;
+        }
+        let mut fields = record.splitn(3, '\t');
+        let (Some(added), Some(deleted), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let (Ok(added), Ok(deleted)) = (added.parse::<u32>(), deleted.parse::<u32>()) else {
+            // Binary files use "-" for both counts.
+            continue;
+        };
+        let destination = if path.is_empty() {
+            let _old_path = parts.next();
+            parts.next()
+        } else {
+            Some(path)
+        };
+        if let Some(destination) = destination {
+            result.insert(destination.to_string(), (added, deleted));
+        }
+    }
+
+    result
 }
 
 fn parse_git_diff_raw_entry<'a>(metadata: &'a str, path: &'a str) -> Result<CommitDiffEntry<'a>> {
@@ -208,17 +251,20 @@ fn parse_git_diff_raw_entry<'a>(metadata: &'a str, path: &'a str) -> Result<Comm
     let new_oid = fields
         .next()
         .context("raw diff is missing the new object ID")?;
-    let status = match fields.next() {
-        Some("M") => StatusCode::Modified,
-        Some("T") => StatusCode::TypeChanged,
-        Some("A") => StatusCode::Added,
-        Some("D") => StatusCode::Deleted,
-        Some(status) => anyhow::bail!("unsupported raw diff status {status}"),
+    let status = match fields.next().and_then(|status| status.as_bytes().first()) {
+        Some(b'M') => StatusCode::Modified,
+        Some(b'T') => StatusCode::TypeChanged,
+        Some(b'A') => StatusCode::Added,
+        Some(b'D') => StatusCode::Deleted,
+        Some(b'R') => StatusCode::Renamed,
+        Some(b'C') => StatusCode::Copied,
+        Some(status) => anyhow::bail!("unsupported raw diff status {}", *status as char),
         None => anyhow::bail!("raw diff is missing the status"),
     };
 
     Ok(CommitDiffEntry {
         path,
+        old_path: None,
         status,
         old_object: (!old_oid.bytes().all(|byte| byte == b'0')).then(|| CommitDiffObject {
             oid: old_oid,
@@ -262,6 +308,7 @@ mod tests {
         };
 
         assert_eq!(file.path, "file.txt");
+        assert_eq!(file.old_path, None);
         assert_eq!(file.status, StatusCode::Modified);
         assert_eq!(
             file.new_object.map(|object| object.kind),
@@ -299,6 +346,42 @@ mod tests {
             .expect("expected a raw diff entry")
             .expect_err("expected malformed metadata to fail");
         assert!(error.to_string().contains("new mode"));
+    }
+
+    #[test]
+    fn test_parse_git_diff_raw_with_rename_and_copy() {
+        let input = concat!(
+            ":100644 100644 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 R100\x00old.txt\x00new.txt\x00",
+            ":100644 100644 3333333333333333333333333333333333333333 4444444444444444444444444444444444444444 C075\x00source.txt\x00copy.txt\x00",
+        );
+
+        let entries = parse_git_diff_raw(input)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].status, StatusCode::Renamed);
+        assert_eq!(entries[0].old_path, Some("old.txt"));
+        assert_eq!(entries[0].path, "new.txt");
+        assert_eq!(entries[1].status, StatusCode::Copied);
+        assert_eq!(entries[1].old_path, Some("source.txt"));
+        assert_eq!(entries[1].path, "copy.txt");
+    }
+
+    #[test]
+    fn test_parse_numstat_z_with_rename_copy_and_binary() {
+        let input = concat!(
+            "3\t1\tfile.txt\x00",
+            "4\t2\t\x00old.txt\x00new.txt\x00",
+            "5\t0\t\x00source.txt\x00copy.txt\x00",
+            "-\t-\timage.png\x00",
+        );
+
+        let stats = parse_numstat_z(input);
+        assert_eq!(stats.get("file.txt"), Some(&(3, 1)));
+        assert_eq!(stats.get("new.txt"), Some(&(4, 2)));
+        assert_eq!(stats.get("copy.txt"), Some(&(5, 0)));
+        assert!(!stats.contains_key("old.txt"));
+        assert!(!stats.contains_key("image.png"));
     }
 
     #[test]

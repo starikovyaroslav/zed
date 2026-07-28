@@ -1,4 +1,4 @@
-use crate::commit::{CommitDiffObject, CommitDiffObjectKind, parse_git_diff_raw};
+use crate::commit::{CommitDiffObject, CommitDiffObjectKind, parse_git_diff_raw, parse_numstat_z};
 use crate::stash::GitStash;
 use crate::status::{DiffTreeType, GitStatus, TreeDiff};
 use crate::{Oid, RunHook, SHORT_SHA_LENGTH};
@@ -519,15 +519,40 @@ pub struct CommitSummary {
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 pub struct CommitDetails {
     pub sha: SharedString,
+    pub parents: Vec<SharedString>,
+    pub subject: SharedString,
+    pub body: SharedString,
     pub message: SharedString,
+    pub author_timestamp: i64,
     pub commit_timestamp: i64,
     pub author_email: SharedString,
     pub author_name: SharedString,
+    pub committer_email: SharedString,
+    pub committer_name: SharedString,
+    pub ref_names: Vec<SharedString>,
+    pub signature: Option<CommitSignature>,
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct CommitSignature {
+    pub status: SharedString,
+    pub signer: SharedString,
+    pub key: SharedString,
+    pub fingerprint: SharedString,
+    pub primary_key_fingerprint: SharedString,
+    pub trust_level: SharedString,
 }
 
 #[derive(Debug)]
 pub struct CommitDiff {
     pub files: Vec<CommitFile>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub enum GitComparisonTarget {
+    Revision(SharedString),
+    Index,
+    Worktree,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -540,11 +565,19 @@ pub enum CommitFileStatus {
     Added,
     Modified,
     Deleted,
+    Renamed,
+    Copied,
 }
 
 #[derive(Debug)]
 pub struct CommitFile {
     pub path: RepoPath,
+    pub old_path: Option<RepoPath>,
+    pub status: CommitFileStatus,
+    pub old_oid: Option<Oid>,
+    pub new_oid: Option<Oid>,
+    pub additions: Option<u32>,
+    pub deletions: Option<u32>,
     pub old_text: Option<String>,
     pub new_text: Option<String>,
     pub is_binary: bool,
@@ -552,11 +585,7 @@ pub struct CommitFile {
 
 impl CommitFile {
     pub fn status(&self) -> CommitFileStatus {
-        match (&self.old_text, &self.new_text) {
-            (None, Some(_)) => CommitFileStatus::Added,
-            (Some(_), None) => CommitFileStatus::Deleted,
-            _ => CommitFileStatus::Modified,
-        }
+        self.status
     }
 }
 
@@ -930,6 +959,21 @@ pub trait GitRepository: Send + Sync {
     fn show(&self, commit: String) -> BoxFuture<'_, Result<CommitDetails>>;
 
     fn load_commit(&self, commit: String, cx: AsyncApp) -> BoxFuture<'_, Result<CommitDiff>>;
+    fn load_commit_metadata(
+        &self,
+        commit: String,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<CommitDiff>> {
+        self.load_commit(commit, cx)
+    }
+    fn compare(
+        &self,
+        _base: SharedString,
+        _target: GitComparisonTarget,
+        _cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<CommitDiff>> {
+        async { bail!("revision comparisons are not supported by this repository backend") }.boxed()
+    }
     fn blame(
         &self,
         path: RepoPath,
@@ -1821,27 +1865,53 @@ impl GitRepository for RealGitRepository {
                     .build_command(&[
                         "show",
                         "--no-patch",
-                        "--format=%H%x00%B%x00%at%x00%ae%x00%an%x00",
+                        "--format=%H%x00%P%x00%s%x00%b%x00%B%x00%at%x00%ct%x00%ae%x00%an%x00%ce%x00%cn%x00%D%x00%G?%x00%GS%x00%GK%x00%GF%x00%GP%x00%GT%x00",
                         &commit,
                     ])
                     .output()
                     .await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "git show failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
                 let output = std::str::from_utf8(&output.stdout)?;
                 let fields = output.split('\0').collect::<Vec<_>>();
-                if fields.len() != 6 {
+                if fields.len() != 19 {
                     bail!("unexpected git-show output for {commit:?}: {output:?}")
                 }
                 let sha = fields[0].to_string().into();
-                let message = fields[1].to_string().into();
-                let commit_timestamp = fields[2].parse()?;
-                let author_email = fields[3].to_string().into();
-                let author_name = fields[4].to_string().into();
+                let signature = (!fields[12].is_empty() && fields[12] != "N").then(|| {
+                    CommitSignature {
+                        status: fields[12].to_string().into(),
+                        signer: fields[13].to_string().into(),
+                        key: fields[14].to_string().into(),
+                        fingerprint: fields[15].to_string().into(),
+                        primary_key_fingerprint: fields[16].to_string().into(),
+                        trust_level: fields[17].trim_end().to_string().into(),
+                    }
+                });
                 Ok(CommitDetails {
                     sha,
-                    message,
-                    commit_timestamp,
-                    author_email,
-                    author_name,
+                    parents: fields[1]
+                        .split_ascii_whitespace()
+                        .map(|parent| parent.to_string().into())
+                        .collect(),
+                    subject: fields[2].to_string().into(),
+                    body: fields[3].to_string().into(),
+                    message: fields[4].to_string().into(),
+                    author_timestamp: fields[5].parse()?,
+                    commit_timestamp: fields[6].parse()?,
+                    author_email: fields[7].to_string().into(),
+                    author_name: fields[8].to_string().into(),
+                    committer_email: fields[9].to_string().into(),
+                    committer_name: fields[10].to_string().into(),
+                    ref_names: fields[11]
+                        .split(", ")
+                        .filter(|name| !name.is_empty())
+                        .map(|name| name.to_string().into())
+                        .collect(),
+                    signature,
                 })
             })
             .boxed()
@@ -1855,7 +1925,9 @@ impl GitRepository for RealGitRepository {
                     "show",
                     "--format=",
                     "-z",
-                    "--no-renames",
+                    "--find-renames",
+                    "--find-copies",
+                    "--find-copies-harder",
                     "--raw",
                     "--no-abbrev",
                     "--first-parent",
@@ -1872,6 +1944,29 @@ impl GitRepository for RealGitRepository {
                 "git show failed: {}",
                 String::from_utf8_lossy(&show_output.stderr)
             );
+
+            let numstat_output = git
+                .build_command(&[
+                    "show",
+                    "--format=",
+                    "-z",
+                    "--find-renames",
+                    "--find-copies",
+                    "--find-copies-harder",
+                    "--numstat",
+                    "--first-parent",
+                ])
+                .arg(&commit)
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .context("loading commit diff stats")?;
+            anyhow::ensure!(
+                numstat_output.status.success(),
+                "git show --numstat failed: {}",
+                String::from_utf8_lossy(&numstat_output.stderr)
+            );
+            let stats = parse_numstat_z(&String::from_utf8_lossy(&numstat_output.stdout));
 
             let show_stdout = String::from_utf8_lossy(&show_output.stdout);
             let changes = parse_git_diff_raw(&show_stdout);
@@ -1942,14 +2037,281 @@ impl GitRepository for RealGitRepository {
                     }
                 });
 
+                let status = match change.status {
+                    crate::status::StatusCode::Added => CommitFileStatus::Added,
+                    crate::status::StatusCode::Deleted => CommitFileStatus::Deleted,
+                    crate::status::StatusCode::Renamed => CommitFileStatus::Renamed,
+                    crate::status::StatusCode::Copied => CommitFileStatus::Copied,
+                    crate::status::StatusCode::Modified
+                    | crate::status::StatusCode::TypeChanged
+                    | crate::status::StatusCode::Unmodified => CommitFileStatus::Modified,
+                };
+                let (additions, deletions) = stats
+                    .get(path)
+                    .copied()
+                    .map_or((None, None), |(added, deleted)| {
+                        (Some(added), Some(deleted))
+                    });
+
                 files.push(CommitFile {
                     path: RepoPath(Arc::from(rel_path)),
+                    old_path: change
+                        .old_path
+                        .and_then(|path| RelPath::from_unix_str(path).ok())
+                        .map(RepoPath::from_rel_path),
+                    status,
+                    old_oid: change.old_object.and_then(|object| object.oid.parse().ok()),
+                    new_oid: change.new_object.and_then(|object| object.oid.parse().ok()),
+                    additions,
+                    deletions,
                     old_text,
                     new_text,
                     is_binary,
                 })
             }
 
+            Ok(CommitDiff { files })
+        })
+        .boxed()
+    }
+
+    fn load_commit_metadata(
+        &self,
+        commit: String,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<CommitDiff>> {
+        let git = self.git_binary();
+        cx.background_spawn(async move {
+            let raw_output = git
+                .build_command(&[
+                    "show",
+                    "--format=",
+                    "-z",
+                    "--find-renames",
+                    "--find-copies",
+                    "--find-copies-harder",
+                    "--raw",
+                    "--no-abbrev",
+                    "--first-parent",
+                ])
+                .arg(&commit)
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .context("loading commit file metadata")?;
+            anyhow::ensure!(
+                raw_output.status.success(),
+                "git show failed: {}",
+                String::from_utf8_lossy(&raw_output.stderr)
+            );
+            let numstat_output = git
+                .build_command(&[
+                    "show",
+                    "--format=",
+                    "-z",
+                    "--find-renames",
+                    "--find-copies",
+                    "--find-copies-harder",
+                    "--numstat",
+                    "--first-parent",
+                ])
+                .arg(&commit)
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .context("loading commit diff stats")?;
+            anyhow::ensure!(
+                numstat_output.status.success(),
+                "git show --numstat failed: {}",
+                String::from_utf8_lossy(&numstat_output.stderr)
+            );
+
+            let stats = parse_numstat_z(&String::from_utf8_lossy(&numstat_output.stdout));
+            let raw = String::from_utf8_lossy(&raw_output.stdout);
+            let files = parse_git_diff_raw(&raw)
+                .map(|change| {
+                    let change = change?;
+                    let path = RelPath::from_unix_str(change.path)?;
+                    let status = match change.status {
+                        crate::status::StatusCode::Added => CommitFileStatus::Added,
+                        crate::status::StatusCode::Deleted => CommitFileStatus::Deleted,
+                        crate::status::StatusCode::Renamed => CommitFileStatus::Renamed,
+                        crate::status::StatusCode::Copied => CommitFileStatus::Copied,
+                        crate::status::StatusCode::Modified
+                        | crate::status::StatusCode::TypeChanged
+                        | crate::status::StatusCode::Unmodified => CommitFileStatus::Modified,
+                    };
+                    let (additions, deletions) = stats
+                        .get(change.path)
+                        .copied()
+                        .map_or((None, None), |(added, deleted)| {
+                            (Some(added), Some(deleted))
+                        });
+                    Ok(CommitFile {
+                        path: RepoPath::from_rel_path(path),
+                        old_path: change
+                            .old_path
+                            .and_then(|path| RelPath::from_unix_str(path).ok())
+                            .map(RepoPath::from_rel_path),
+                        status,
+                        old_oid: change.old_object.and_then(|object| object.oid.parse().ok()),
+                        new_oid: change.new_object.and_then(|object| object.oid.parse().ok()),
+                        additions,
+                        deletions,
+                        old_text: None,
+                        new_text: None,
+                        is_binary: additions.is_none() && deletions.is_none(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            Ok(CommitDiff { files })
+        })
+        .boxed()
+    }
+
+    fn compare(
+        &self,
+        base: SharedString,
+        target: GitComparisonTarget,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<CommitDiff>> {
+        let git = self.git_binary();
+        cx.background_spawn(async move {
+            let include_untracked = matches!(&target, GitComparisonTarget::Worktree);
+            let mut raw_args = vec![
+                "diff".to_string(),
+                "-z".to_string(),
+                "--find-renames".to_string(),
+                "--find-copies".to_string(),
+                "--find-copies-harder".to_string(),
+                "--raw".to_string(),
+                "--no-abbrev".to_string(),
+            ];
+            let mut numstat_args = vec![
+                "diff".to_string(),
+                "-z".to_string(),
+                "--find-renames".to_string(),
+                "--find-copies".to_string(),
+                "--find-copies-harder".to_string(),
+                "--numstat".to_string(),
+            ];
+            match target {
+                GitComparisonTarget::Revision(head) => {
+                    raw_args.extend([base.to_string(), head.to_string()]);
+                    numstat_args.extend([base.to_string(), head.to_string()]);
+                }
+                GitComparisonTarget::Index => {
+                    raw_args.extend(["--cached".into(), base.to_string()]);
+                    numstat_args.extend(["--cached".into(), base.to_string()]);
+                }
+                GitComparisonTarget::Worktree => {
+                    raw_args.push(base.to_string());
+                    numstat_args.push(base.to_string());
+                }
+            }
+
+            let raw_output = git
+                .build_command(&raw_args)
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .context("loading comparison file metadata")?;
+            anyhow::ensure!(
+                raw_output.status.success(),
+                "git diff failed: {}",
+                String::from_utf8_lossy(&raw_output.stderr)
+            );
+            let numstat_output = git
+                .build_command(&numstat_args)
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .context("loading comparison diff stats")?;
+            anyhow::ensure!(
+                numstat_output.status.success(),
+                "git diff --numstat failed: {}",
+                String::from_utf8_lossy(&numstat_output.stderr)
+            );
+
+            let stats = parse_numstat_z(&String::from_utf8_lossy(&numstat_output.stdout));
+            let raw = String::from_utf8_lossy(&raw_output.stdout);
+            let mut files = parse_git_diff_raw(&raw)
+                .map(|change| {
+                    let change = change?;
+                    let path = RepoPath::from_rel_path(RelPath::from_unix_str(change.path)?);
+                    let status = match change.status {
+                        crate::status::StatusCode::Added => CommitFileStatus::Added,
+                        crate::status::StatusCode::Deleted => CommitFileStatus::Deleted,
+                        crate::status::StatusCode::Renamed => CommitFileStatus::Renamed,
+                        crate::status::StatusCode::Copied => CommitFileStatus::Copied,
+                        crate::status::StatusCode::Modified
+                        | crate::status::StatusCode::TypeChanged
+                        | crate::status::StatusCode::Unmodified => CommitFileStatus::Modified,
+                    };
+                    let (additions, deletions) = stats
+                        .get(change.path)
+                        .copied()
+                        .map_or((None, None), |(added, deleted)| {
+                            (Some(added), Some(deleted))
+                        });
+                    Ok(CommitFile {
+                        path,
+                        old_path: change
+                            .old_path
+                            .map(RelPath::from_unix_str)
+                            .transpose()?
+                            .map(RepoPath::from_rel_path),
+                        status,
+                        old_oid: change
+                            .old_object
+                            .map(|object| object.oid.parse())
+                            .transpose()?,
+                        new_oid: change
+                            .new_object
+                            .map(|object| object.oid.parse())
+                            .transpose()?,
+                        additions,
+                        deletions,
+                        old_text: None,
+                        new_text: None,
+                        is_binary: additions.is_none() && deletions.is_none(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if include_untracked {
+                let untracked_output = git
+                    .build_command(&["ls-files", "--others", "--exclude-standard", "-z"])
+                    .output()
+                    .await
+                    .context("loading untracked comparison files")?;
+                anyhow::ensure!(
+                    untracked_output.status.success(),
+                    "git ls-files failed: {}",
+                    String::from_utf8_lossy(&untracked_output.stderr)
+                );
+                for path in String::from_utf8_lossy(&untracked_output.stdout)
+                    .split('\0')
+                    .filter(|path| !path.is_empty())
+                {
+                    let path = RepoPath::from_rel_path(RelPath::from_unix_str(path)?);
+                    if files.iter().any(|file| file.path == path) {
+                        continue;
+                    }
+                    files.push(CommitFile {
+                        path,
+                        old_path: None,
+                        status: CommitFileStatus::Added,
+                        old_oid: None,
+                        new_oid: None,
+                        additions: None,
+                        deletions: None,
+                        old_text: None,
+                        new_text: None,
+                        is_binary: false,
+                    });
+                }
+            }
             Ok(CommitDiff { files })
         })
         .boxed()
@@ -4880,6 +5242,145 @@ mod tests {
             .apply_operation_action(crate::operation::GitOperationAction::Abort)
             .await
             .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_commit_details_and_metadata_include_renames_copies_and_stats(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().expect("failed to create temporary repository");
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("old.txt"), "one\ntwo\n").unwrap();
+        fs::write(repo_dir.path().join("source.txt"), "copy source\n").unwrap();
+        git_command(repo_dir.path(), ["add", "."]);
+        git_command(repo_dir.path(), ["commit", "-m", "initial"]);
+        let initial_commit = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]);
+
+        git_command(repo_dir.path(), ["mv", "old.txt", "renamed.txt"]);
+        fs::copy(
+            repo_dir.path().join("source.txt"),
+            repo_dir.path().join("copy.txt"),
+        )
+        .unwrap();
+        fs::write(repo_dir.path().join("renamed.txt"), "one\ntwo\nthree\n").unwrap();
+        git_command(repo_dir.path(), ["add", "."]);
+        git_command(
+            repo_dir.path(),
+            ["commit", "-m", "Inspect history", "-m", "Commit body"],
+        );
+        git_command(repo_dir.path(), ["tag", "inspection"]);
+
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .expect("failed to open repository");
+
+        let details = repository.show("HEAD".into()).await.unwrap();
+        assert_eq!(details.subject.as_ref(), "Inspect history");
+        assert_eq!(details.body.trim(), "Commit body");
+        assert_eq!(details.parents.len(), 1);
+        assert!(
+            details
+                .ref_names
+                .iter()
+                .any(|name| name.contains("inspection"))
+        );
+        assert!(!details.author_name.is_empty());
+        assert!(!details.committer_name.is_empty());
+        assert!(details.author_timestamp > 0);
+        assert!(details.commit_timestamp > 0);
+        assert_eq!(details.signature, None);
+
+        let diff = repository
+            .load_commit_metadata("HEAD".into(), cx.to_async())
+            .await
+            .unwrap();
+        let renamed = diff
+            .files
+            .iter()
+            .find(|file| file.path.as_unix_str() == "renamed.txt")
+            .expect("renamed file should be present");
+        assert_eq!(renamed.status(), CommitFileStatus::Renamed);
+        assert_eq!(
+            renamed.old_path.as_ref().map(|path| path.as_unix_str()),
+            Some("old.txt")
+        );
+        assert_eq!((renamed.additions, renamed.deletions), (Some(1), Some(0)));
+        assert!(renamed.old_text.is_none());
+        assert!(renamed.new_text.is_none());
+        assert!(renamed.old_oid.is_some());
+        assert!(renamed.new_oid.is_some());
+
+        let copied = diff
+            .files
+            .iter()
+            .find(|file| file.path.as_unix_str() == "copy.txt")
+            .expect("copied file should be present");
+        assert_eq!(copied.status(), CommitFileStatus::Copied);
+        assert_eq!(
+            copied.old_path.as_ref().map(|path| path.as_unix_str()),
+            Some("source.txt")
+        );
+        assert_eq!((copied.additions, copied.deletions), (Some(0), Some(0)));
+
+        let comparison = repository
+            .compare(
+                initial_commit.clone().into(),
+                GitComparisonTarget::Revision("HEAD".into()),
+                cx.to_async(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(comparison.files.len(), diff.files.len());
+        assert!(
+            comparison
+                .files
+                .iter()
+                .any(|file| file.status() == CommitFileStatus::Renamed)
+        );
+
+        fs::write(repo_dir.path().join("staged.txt"), "staged\n").unwrap();
+        git_command(repo_dir.path(), ["add", "staged.txt"]);
+        fs::write(
+            repo_dir.path().join("source.txt"),
+            "copy source\nworking change\n",
+        )
+        .unwrap();
+        fs::write(repo_dir.path().join("untracked.txt"), "untracked\n").unwrap();
+        let index_comparison = repository
+            .compare("HEAD".into(), GitComparisonTarget::Index, cx.to_async())
+            .await
+            .unwrap();
+        assert_eq!(index_comparison.files.len(), 1);
+        assert_eq!(index_comparison.files[0].path.as_unix_str(), "staged.txt");
+        let worktree_comparison = repository
+            .compare("HEAD".into(), GitComparisonTarget::Worktree, cx.to_async())
+            .await
+            .unwrap();
+        assert!(
+            worktree_comparison
+                .files
+                .iter()
+                .any(|file| file.path.as_unix_str() == "staged.txt")
+        );
+        assert!(
+            worktree_comparison
+                .files
+                .iter()
+                .any(|file| file.path.as_unix_str() == "source.txt")
+        );
+        assert!(
+            worktree_comparison
+                .files
+                .iter()
+                .any(|file| file.path.as_unix_str() == "untracked.txt")
+        );
     }
 
     #[gpui::test]

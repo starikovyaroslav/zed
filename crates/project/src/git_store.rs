@@ -36,11 +36,11 @@ use git::{
     parse_git_remote_url,
     repository::{
         Branch, BranchesScanResult, CommitData, CommitDetails, CommitDiff, CommitFile,
-        CommitOptions, CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions,
-        FileHistoryChangedFileSets, GitCommitTemplate, GitRepository, GitRepositoryCheckpoint,
-        InitialGraphCommitData, LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput,
-        RepoPath, ResetMode, SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree,
-        delete_branch_flag,
+        CommitFileStatus, CommitOptions, CommitSignature, CreateWorktreeTarget, DiffStatType,
+        DiffType, FetchOptions, FileHistoryChangedFileSets, GitCommitTemplate, GitComparisonTarget,
+        GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource,
+        PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs,
+        UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag,
     },
     stash::{GitStash, StashEntry},
     status::{
@@ -808,6 +808,7 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_compare_checkpoints);
         client.add_entity_request_handler(Self::handle_diff_checkpoints);
         client.add_entity_request_handler(Self::handle_load_commit_diff);
+        client.add_entity_request_handler(Self::handle_compare_git_revisions);
         client.add_entity_request_handler(Self::handle_checkout_files);
         client.add_entity_request_handler(Self::handle_add_path_to_gitignore);
         client.add_entity_request_handler(Self::handle_add_path_to_git_info_exclude);
@@ -3712,13 +3713,7 @@ impl GitStore {
                 repository_handle.show(envelope.payload.commit)
             })
             .await??;
-        Ok(proto::GitCommitDetails {
-            sha: commit.sha.into(),
-            message: commit.message.into(),
-            commit_timestamp: commit.commit_timestamp,
-            author_email: commit.author_email.into(),
-            author_name: commit.author_name.into(),
-        })
+        Ok(commit_details_to_proto(&commit))
     }
 
     async fn handle_create_checkpoint(
@@ -3854,22 +3849,50 @@ impl GitStore {
         let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
         let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
 
+        let include_text = envelope.payload.include_text;
         let commit_diff = repository_handle
             .update(&mut cx, |repository_handle, _| {
-                repository_handle.load_commit_diff(envelope.payload.commit)
+                if include_text {
+                    repository_handle.load_commit_diff(envelope.payload.commit)
+                } else {
+                    repository_handle.load_commit_diff_metadata(envelope.payload.commit)
+                }
             })
             .await??;
         Ok(proto::LoadCommitDiffResponse {
             files: commit_diff
                 .files
                 .into_iter()
-                .map(|file| proto::CommitFile {
-                    path: file.path.as_unix_str().to_owned(),
-                    old_text: file.old_text,
-                    new_text: file.new_text,
-                    is_binary: file.is_binary,
-                })
+                .map(commit_file_to_proto)
                 .collect(),
+        })
+    }
+
+    async fn handle_compare_git_revisions(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::CompareGitRevisions>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::CompareGitRevisionsResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let target = match envelope
+            .payload
+            .target
+            .context("missing comparison target")?
+        {
+            proto::compare_git_revisions::Target::Revision(revision) => {
+                GitComparisonTarget::Revision(revision.into())
+            }
+            proto::compare_git_revisions::Target::Index(_) => GitComparisonTarget::Index,
+            proto::compare_git_revisions::Target::Worktree(_) => GitComparisonTarget::Worktree,
+        };
+        let diff = repository_handle
+            .update(&mut cx, |repository, _| {
+                repository.compare(envelope.payload.base.into(), target)
+            })
+            .await??;
+        Ok(proto::CompareGitRevisionsResponse {
+            files: diff.files.into_iter().map(commit_file_to_proto).collect(),
         })
     }
 
@@ -6378,13 +6401,7 @@ impl Repository {
                         })
                         .await?;
 
-                    Ok(CommitDetails {
-                        sha: resp.sha.into(),
-                        message: resp.message.into(),
-                        commit_timestamp: resp.commit_timestamp,
-                        author_email: resp.author_email.into(),
-                        author_name: resp.author_name.into(),
-                    })
+                    Ok(proto_to_commit_details(&resp))
                 }
             }
         })
@@ -6405,25 +6422,56 @@ impl Repository {
                             project_id: project_id.0,
                             repository_id: id.to_proto(),
                             commit,
+                            include_text: true,
                         })
                         .await?;
                     Ok(CommitDiff {
                         files: response
                             .files
                             .into_iter()
-                            .map(|file| {
-                                Ok(CommitFile {
-                                    path: RepoPath::from_proto(&file.path)?,
-                                    old_text: file.old_text,
-                                    new_text: file.new_text,
-                                    is_binary: file.is_binary,
-                                })
-                            })
+                            .map(commit_file_from_proto)
                             .collect::<Result<Vec<_>>>()?,
                     })
                 }
             }
         })
+    }
+
+    pub fn load_commit_diff_metadata(
+        &mut self,
+        commit: String,
+    ) -> oneshot::Receiver<Result<CommitDiff>> {
+        let id = self.id;
+        self.send_job(
+            "load_commit_diff_metadata",
+            None,
+            move |git_repo, cx| async move {
+                match git_repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.load_commit_metadata(commit, cx).await
+                    }
+                    RepositoryState::Remote(RemoteRepositoryState {
+                        client, project_id, ..
+                    }) => {
+                        let response = client
+                            .request(proto::LoadCommitDiff {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                                commit,
+                                include_text: false,
+                            })
+                            .await?;
+                        Ok(CommitDiff {
+                            files: response
+                                .files
+                                .into_iter()
+                                .map(commit_file_from_proto)
+                                .collect::<Result<Vec<_>>>()?,
+                        })
+                    }
+                }
+            },
+        )
     }
 
     pub fn file_history_changed_files(
@@ -6788,6 +6836,55 @@ impl Repository {
             debug_assert!(!has_failed, "This should always be inserted");
             &CommitDataState::Loading(None)
         })
+    }
+
+    pub fn compare(
+        &mut self,
+        base: SharedString,
+        target: GitComparisonTarget,
+    ) -> oneshot::Receiver<Result<CommitDiff>> {
+        let id = self.id;
+        self.send_job(
+            "compare_git_revisions",
+            None,
+            move |git_repo, cx| async move {
+                match git_repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.compare(base, target, cx).await
+                    }
+                    RepositoryState::Remote(RemoteRepositoryState {
+                        client, project_id, ..
+                    }) => {
+                        let target = match target {
+                            GitComparisonTarget::Revision(revision) => {
+                                proto::compare_git_revisions::Target::Revision(revision.to_string())
+                            }
+                            GitComparisonTarget::Index => {
+                                proto::compare_git_revisions::Target::Index(true)
+                            }
+                            GitComparisonTarget::Worktree => {
+                                proto::compare_git_revisions::Target::Worktree(true)
+                            }
+                        };
+                        let response = client
+                            .request(proto::CompareGitRevisions {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                                base: base.to_string(),
+                                target: Some(target),
+                            })
+                            .await?;
+                        Ok(CommitDiff {
+                            files: response
+                                .files
+                                .into_iter()
+                                .map(commit_file_from_proto)
+                                .collect::<Result<Vec<_>>>()?,
+                        })
+                    }
+                }
+            },
+        )
     }
 
     fn get_handler(&mut self, cx: &mut Context<Self>) -> &mut CommitDataHandler {
@@ -10512,17 +10609,97 @@ fn commit_details_to_proto(commit: &CommitDetails) -> proto::GitCommitDetails {
         commit_timestamp: commit.commit_timestamp,
         author_email: commit.author_email.to_string(),
         author_name: commit.author_name.to_string(),
+        parents: commit.parents.iter().map(ToString::to_string).collect(),
+        subject: commit.subject.to_string(),
+        body: commit.body.to_string(),
+        author_timestamp: commit.author_timestamp,
+        committer_email: commit.committer_email.to_string(),
+        committer_name: commit.committer_name.to_string(),
+        ref_names: commit.ref_names.iter().map(ToString::to_string).collect(),
+        signature: commit
+            .signature
+            .as_ref()
+            .map(|signature| proto::GitCommitSignature {
+                status: signature.status.to_string(),
+                signer: signature.signer.to_string(),
+                key: signature.key.to_string(),
+                fingerprint: signature.fingerprint.to_string(),
+                primary_key_fingerprint: signature.primary_key_fingerprint.to_string(),
+                trust_level: signature.trust_level.to_string(),
+            }),
     }
 }
 
 fn proto_to_commit_details(proto: &proto::GitCommitDetails) -> CommitDetails {
     CommitDetails {
         sha: proto.sha.clone().into(),
+        parents: proto.parents.iter().cloned().map(Into::into).collect(),
+        subject: proto.subject.clone().into(),
+        body: proto.body.clone().into(),
         message: proto.message.clone().into(),
+        author_timestamp: proto.author_timestamp,
         commit_timestamp: proto.commit_timestamp,
         author_email: proto.author_email.clone().into(),
         author_name: proto.author_name.clone().into(),
+        committer_email: proto.committer_email.clone().into(),
+        committer_name: proto.committer_name.clone().into(),
+        ref_names: proto.ref_names.iter().cloned().map(Into::into).collect(),
+        signature: proto.signature.as_ref().map(|signature| CommitSignature {
+            status: signature.status.clone().into(),
+            signer: signature.signer.clone().into(),
+            key: signature.key.clone().into(),
+            fingerprint: signature.fingerprint.clone().into(),
+            primary_key_fingerprint: signature.primary_key_fingerprint.clone().into(),
+            trust_level: signature.trust_level.clone().into(),
+        }),
     }
+}
+
+fn commit_file_to_proto(file: CommitFile) -> proto::CommitFile {
+    proto::CommitFile {
+        path: file.path.as_unix_str().to_owned(),
+        old_text: file.old_text,
+        new_text: file.new_text,
+        is_binary: file.is_binary,
+        old_path: file.old_path.map(|path| path.as_unix_str().to_owned()),
+        old_oid: file.old_oid.map(|oid| oid.to_string()),
+        new_oid: file.new_oid.map(|oid| oid.to_string()),
+        additions: file.additions,
+        deletions: file.deletions,
+        status: match file.status {
+            CommitFileStatus::Modified => proto::commit_file::CommitFileStatus::Modified,
+            CommitFileStatus::Added => proto::commit_file::CommitFileStatus::Added,
+            CommitFileStatus::Deleted => proto::commit_file::CommitFileStatus::Deleted,
+            CommitFileStatus::Renamed => proto::commit_file::CommitFileStatus::Renamed,
+            CommitFileStatus::Copied => proto::commit_file::CommitFileStatus::Copied,
+        }
+        .into(),
+    }
+}
+
+fn commit_file_from_proto(file: proto::CommitFile) -> Result<CommitFile> {
+    Ok(CommitFile {
+        path: RepoPath::from_proto(&file.path)?,
+        old_path: file
+            .old_path
+            .as_deref()
+            .map(RepoPath::from_proto)
+            .transpose()?,
+        status: match file.status() {
+            proto::commit_file::CommitFileStatus::Modified => CommitFileStatus::Modified,
+            proto::commit_file::CommitFileStatus::Added => CommitFileStatus::Added,
+            proto::commit_file::CommitFileStatus::Deleted => CommitFileStatus::Deleted,
+            proto::commit_file::CommitFileStatus::Renamed => CommitFileStatus::Renamed,
+            proto::commit_file::CommitFileStatus::Copied => CommitFileStatus::Copied,
+        },
+        old_oid: file.old_oid.as_deref().map(str::parse).transpose()?,
+        new_oid: file.new_oid.as_deref().map(str::parse).transpose()?,
+        additions: file.additions,
+        deletions: file.deletions,
+        old_text: file.old_text,
+        new_text: file.new_text,
+        is_binary: file.is_binary,
+    })
 }
 
 async fn append_pattern_to_ignore_file(
@@ -10636,6 +10813,56 @@ mod tests {
             operation_result_from_proto(operation_result_to_proto(Err(error.clone()))),
             Err(error)
         );
+    }
+
+    #[test]
+    fn test_commit_inspection_proto_roundtrip_preserves_metadata() {
+        let details = CommitDetails {
+            sha: "1111111111111111111111111111111111111111".into(),
+            parents: vec!["2222222222222222222222222222222222222222".into()],
+            subject: "Subject".into(),
+            body: "Body".into(),
+            message: "Subject\n\nBody".into(),
+            author_timestamp: 10,
+            commit_timestamp: 20,
+            author_email: "author@example.com".into(),
+            author_name: "Author".into(),
+            committer_email: "committer@example.com".into(),
+            committer_name: "Committer".into(),
+            ref_names: vec!["HEAD -> main".into(), "tag: v1".into()],
+            signature: Some(CommitSignature {
+                status: "G".into(),
+                signer: "Signer".into(),
+                key: "ABC".into(),
+                fingerprint: "DEF".into(),
+                primary_key_fingerprint: "123".into(),
+                trust_level: "ultimate".into(),
+            }),
+        };
+        assert_eq!(
+            proto_to_commit_details(&commit_details_to_proto(&details)),
+            details
+        );
+
+        let file = CommitFile {
+            path: repo_path("src/new.rs"),
+            old_path: Some(repo_path("src/old.rs")),
+            status: CommitFileStatus::Renamed,
+            old_oid: Some("3333333333333333333333333333333333333333".parse().unwrap()),
+            new_oid: Some("4444444444444444444444444444444444444444".parse().unwrap()),
+            additions: Some(5),
+            deletions: Some(2),
+            old_text: None,
+            new_text: None,
+            is_binary: false,
+        };
+        let restored = commit_file_from_proto(commit_file_to_proto(file)).unwrap();
+        assert_eq!(restored.path, repo_path("src/new.rs"));
+        assert_eq!(restored.old_path, Some(repo_path("src/old.rs")));
+        assert_eq!(restored.status(), CommitFileStatus::Renamed);
+        assert_eq!((restored.additions, restored.deletions), (Some(5), Some(2)));
+        assert!(restored.old_oid.is_some());
+        assert!(restored.new_oid.is_some());
     }
 
     #[test]
