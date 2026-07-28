@@ -375,6 +375,23 @@ message GitCommitDetails {
   int64 commit_timestamp = 3;
   string author_email = 4;
   string author_name = 5;
+  repeated string parents = 6;
+  string subject = 7;
+  string body = 8;
+  int64 author_timestamp = 9;
+  string committer_email = 10;
+  string committer_name = 11;
+  repeated string ref_names = 12;
+  optional GitCommitSignature signature = 13;
+}
+
+message GitCommitSignature {
+  string status = 1;
+  string signer = 2;
+  string key = 3;
+  string fingerprint = 4;
+  string primary_key_fingerprint = 5;
+  string trust_level = 6;
 }
 
 message LoadCommitDiff {
@@ -382,9 +399,25 @@ message LoadCommitDiff {
   reserved 2;
   uint64 repository_id = 3;
   string commit = 4;
+  bool include_text = 5;
 }
 
 message LoadCommitDiffResponse {
+  repeated CommitFile files = 1;
+}
+
+message CompareGitRevisions {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  string base = 3;
+  oneof target {
+    string revision = 4;
+    bool index = 5;
+    bool worktree = 6;
+  }
+}
+
+message CompareGitRevisionsResponse {
   repeated CommitFile files = 1;
 }
 
@@ -393,6 +426,20 @@ message CommitFile {
   optional string old_text = 2;
   optional string new_text = 3;
   bool is_binary = 4;
+  optional string old_path = 5;
+  optional string old_oid = 6;
+  optional string new_oid = 7;
+  optional uint32 additions = 8;
+  optional uint32 deletions = 9;
+  CommitFileStatus status = 10;
+
+  enum CommitFileStatus {
+    MODIFIED = 0;
+    ADDED = 1;
+    DELETED = 2;
+    RENAMED = 3;
+    COPIED = 4;
+  }
 }
 
 message GitReset {

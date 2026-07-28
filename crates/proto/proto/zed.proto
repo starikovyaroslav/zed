@@ -508,7 +508,9 @@ message Envelope {
     RefreshDocumentSymbols refresh_document_symbols = 477;
     GitOperationRequest git_operation_request = 478;
     GitOperationActionRequest git_operation_action_request = 479;
-    GitOperationResponse git_operation_response = 480; // current max
+    GitOperationResponse git_operation_response = 480;
+    CompareGitRevisions compare_git_revisions = 481;
+    CompareGitRevisionsResponse compare_git_revisions_response = 482; // current max
   }
 
   reserved 87 to 88;
