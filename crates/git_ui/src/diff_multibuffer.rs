@@ -882,6 +882,7 @@ impl Render for DiffMultibuffer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_empty = self.multibuffer.read(cx).is_empty();
         let is_loading = self.branch_diff.read(cx).is_tree_base_loading() || !self._task.is_ready();
+        let load_error = self.branch_diff.read(cx).load_error().cloned();
         let empty_label = self.empty_label.clone();
 
         div()
@@ -902,7 +903,22 @@ impl Render for DiffMultibuffer {
                         .into_any_element(),
                 )
             })
-            .when(is_empty && !is_loading, |el| {
+            .when_some(
+                (is_empty && !is_loading)
+                    .then_some(load_error.clone())
+                    .flatten(),
+                |el, error| {
+                    el.child(
+                        v_flex()
+                            .max_w_96()
+                            .gap_1()
+                            .items_center()
+                            .child(Label::new("Unable to load comparison").color(Color::Error))
+                            .child(Label::new(error).size(LabelSize::Small).color(Color::Muted)),
+                    )
+                },
+            )
+            .when(is_empty && !is_loading && load_error.is_none(), |el| {
                 let remote_button = if let Some(panel) = self
                     .workspace
                     .upgrade()

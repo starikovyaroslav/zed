@@ -3,17 +3,19 @@ use buffer_diff::BufferDiff;
 use collections::HashSet;
 use futures::StreamExt;
 use git::{
-    repository::RepoPath,
+    repository::{CommitDiff, CommitFile, CommitFileStatus, GitComparisonTarget, RepoPath},
     status::{DiffTreeType, FileStatus, StatusCode, TrackedStatus, TreeDiff, TreeDiffStatus},
 };
 use gpui::{
-    App, AsyncApp, AsyncWindowContext, Context, Entity, EventEmitter, SharedString, Subscription,
-    Task, WeakEntity, Window,
+    App, AppContext as _, AsyncApp, AsyncWindowContext, Context, Entity, EventEmitter,
+    SharedString, Subscription, Task, WeakEntity, Window,
 };
 
-use language::Buffer;
+use language::{Buffer, Capability, DiskState};
+use settings::WorktreeId;
+use std::{path::PathBuf, sync::Arc};
 use text::BufferId;
-use util::ResultExt;
+use util::{ResultExt, paths::PathStyle, rel_path::RelPath};
 use ztracing::instrument;
 
 use crate::{
@@ -26,12 +28,29 @@ pub enum DiffBase {
     Head,
     Index,
     Staged,
-    Merge { base_ref: SharedString },
+    Merge {
+        base_ref: SharedString,
+    },
+    Comparison {
+        base: SharedString,
+        target: ComparisonTarget,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ComparisonTarget {
+    Revision(SharedString),
+    Index,
+    Worktree,
 }
 
 impl DiffBase {
     pub fn is_merge_base(&self) -> bool {
         matches!(self, DiffBase::Merge { .. })
+    }
+
+    pub fn is_comparison(&self) -> bool {
+        matches!(self, DiffBase::Comparison { .. })
     }
 }
 
@@ -42,6 +61,8 @@ pub struct DiffBufferList {
     base_commit: Option<SharedString>,
     head_commit: Option<SharedString>,
     tree_diff: Option<TreeDiff>,
+    comparison_diff: Option<CommitDiff>,
+    load_error: Option<SharedString>,
     tree_diff_update_needed: bool,
     tree_diff_base_task: Option<Task<()>>,
     _subscription: Subscription,
@@ -52,6 +73,16 @@ pub struct DiffBufferList {
 pub enum BranchDiffEvent {
     FileListChanged,
     DiffBaseChanged,
+}
+
+enum ReloadDiffTask {
+    Tree(futures::channel::oneshot::Receiver<Result<TreeDiff>>),
+    Comparison(futures::channel::oneshot::Receiver<Result<CommitDiff>>),
+}
+
+enum ReloadedDiff {
+    Tree(TreeDiff),
+    Comparison(CommitDiff),
 }
 
 impl EventEmitter<BranchDiffEvent> for DiffBufferList {}
@@ -85,6 +116,8 @@ impl DiffBufferList {
                 };
 
                 if should_update {
+                    this.tree_diff_update_needed =
+                        this.diff_base.is_merge_base() || this.diff_base.is_comparison();
                     cx.emit(BranchDiffEvent::FileListChanged);
                     *this.update_needed.borrow_mut() = ();
                 }
@@ -102,6 +135,8 @@ impl DiffBufferList {
             repo,
             project,
             tree_diff: None,
+            comparison_diff: None,
+            load_error: None,
             tree_diff_update_needed: false,
             tree_diff_base_task: None,
             base_commit: None,
@@ -128,7 +163,10 @@ impl DiffBufferList {
 
         self.repo = repo;
         self.tree_diff = None;
-        self.tree_diff_update_needed = self.diff_base.is_merge_base();
+        self.comparison_diff = None;
+        self.load_error = None;
+        self.tree_diff_update_needed =
+            self.diff_base.is_merge_base() || self.diff_base.is_comparison();
         self.tree_diff_base_task = None;
         self.base_commit = None;
         self.head_commit = None;
@@ -141,8 +179,10 @@ impl DiffBufferList {
             return;
         }
 
-        self.tree_diff_update_needed = diff_base.is_merge_base();
+        self.tree_diff_update_needed = diff_base.is_merge_base() || diff_base.is_comparison();
         self.tree_diff = None;
+        self.comparison_diff = None;
+        self.load_error = None;
         self.tree_diff_base_task = None;
         self.diff_base = diff_base;
         self.base_commit = None;
@@ -281,15 +321,24 @@ impl DiffBufferList {
     }
 
     fn spawn_reload_tree_diff(&mut self, cx: &mut Context<Self>) {
-        if !self.diff_base.is_merge_base() {
+        if !self.diff_base.is_merge_base() && !self.diff_base.is_comparison() {
             return;
         }
 
         let task = cx.spawn(async move |this, cx| {
-            Self::reload_tree_diff(this, cx).await.log_err();
+            if let Err(error) = Self::reload_tree_diff(this.clone(), cx).await {
+                log::error!("failed to reload git comparison: {error:#}");
+                this.update(cx, |this, cx| {
+                    this.load_error = Some(error.to_string().into());
+                    cx.emit(BranchDiffEvent::FileListChanged);
+                    cx.notify();
+                })
+                .ok();
+            }
         });
 
         self.tree_diff_base_task = Some(task);
+        self.load_error = None;
         cx.notify();
     }
 
@@ -299,30 +348,63 @@ impl DiffBufferList {
             .is_some_and(|task| !task.is_ready())
     }
 
+    pub fn load_error(&self) -> Option<&SharedString> {
+        self.load_error.as_ref()
+    }
+
     pub async fn reload_tree_diff(this: WeakEntity<Self>, cx: &mut AsyncApp) -> Result<()> {
         let task = this.update(cx, |this, cx| {
-            let DiffBase::Merge { base_ref } = this.diff_base.clone() else {
-                return None;
-            };
             let Some(repo) = this.repo.as_ref() else {
                 this.tree_diff.take();
+                this.comparison_diff.take();
                 return None;
             };
-            repo.update(cx, |repo, cx| {
-                Some(repo.diff_tree(
-                    DiffTreeType::MergeBase {
-                        base: base_ref,
-                        head: "HEAD".into(),
-                    },
-                    cx,
-                ))
-            })
+            match this.diff_base.clone() {
+                DiffBase::Merge { base_ref } => {
+                    let task = repo.update(cx, |repo, cx| {
+                        repo.diff_tree(
+                            DiffTreeType::MergeBase {
+                                base: base_ref,
+                                head: "HEAD".into(),
+                            },
+                            cx,
+                        )
+                    });
+                    Some(ReloadDiffTask::Tree(task))
+                }
+                DiffBase::Comparison { base, target } => {
+                    let target = match target {
+                        ComparisonTarget::Revision(revision) => {
+                            GitComparisonTarget::Revision(revision)
+                        }
+                        ComparisonTarget::Index => GitComparisonTarget::Index,
+                        ComparisonTarget::Worktree => GitComparisonTarget::Worktree,
+                    };
+                    Some(ReloadDiffTask::Comparison(
+                        repo.update(cx, |repo, _| repo.compare(base, target)),
+                    ))
+                }
+                DiffBase::Head | DiffBase::Index | DiffBase::Staged => None,
+            }
         })?;
         let Some(task) = task else { return Ok(()) };
 
-        let diff = task.await??;
+        let diff = match task {
+            ReloadDiffTask::Tree(task) => ReloadedDiff::Tree(task.await??),
+            ReloadDiffTask::Comparison(task) => ReloadedDiff::Comparison(task.await??),
+        };
         this.update(cx, |this, cx| {
-            this.tree_diff = Some(diff);
+            match diff {
+                ReloadedDiff::Tree(diff) => {
+                    this.tree_diff = Some(diff);
+                    this.comparison_diff = None;
+                }
+                ReloadedDiff::Comparison(diff) => {
+                    this.comparison_diff = Some(diff);
+                    this.tree_diff = None;
+                }
+            }
+            this.load_error = None;
             cx.emit(BranchDiffEvent::FileListChanged);
             cx.notify();
         })
@@ -338,7 +420,34 @@ impl DiffBufferList {
         let Some(repo) = self.repo.clone() else {
             return output;
         };
-        if self.diff_base.is_merge_base() && self.tree_diff.is_none() {
+        if (self.diff_base.is_merge_base() && self.tree_diff.is_none())
+            || (self.diff_base.is_comparison() && self.comparison_diff.is_none())
+        {
+            return output;
+        }
+
+        if let DiffBase::Comparison { target, .. } = self.diff_base.clone() {
+            let Some(diff) = self.comparison_diff.as_ref() else {
+                return output;
+            };
+            for file in &diff.files {
+                let Some(project_path) = repo.read(cx).repo_path_to_project_path(&file.path, cx)
+                else {
+                    continue;
+                };
+                output.push(DiffBuffer {
+                    repo_path: file.path.clone(),
+                    load: Self::load_comparison_buffer(
+                        self.project.clone(),
+                        target.clone(),
+                        file,
+                        project_path,
+                        repo.clone(),
+                        cx,
+                    ),
+                    file_status: comparison_file_status(file.status()),
+                });
+            }
             return output;
         }
 
@@ -358,6 +467,7 @@ impl DiffBufferList {
                     }
                     DiffBase::Index => item.status.staging().has_unstaged().then_some(item.status),
                     DiffBase::Staged => item.status.staging().has_staged().then_some(item.status),
+                    DiffBase::Comparison { .. } => unreachable!(),
                 }) else {
                     continue;
                 };
@@ -414,6 +524,120 @@ impl DiffBufferList {
             }
         });
         output
+    }
+
+    #[instrument(skip_all)]
+    fn load_comparison_buffer(
+        project: Entity<Project>,
+        target: ComparisonTarget,
+        file: &CommitFile,
+        project_path: crate::ProjectPath,
+        repo: Entity<Repository>,
+        cx: &Context<'_, Self>,
+    ) -> Task<Result<LoadedDiffBuffer>> {
+        let old_oid = file.old_oid;
+        let new_oid = file.new_oid;
+        let file_status = file.status();
+        let is_binary = file.is_binary;
+        let repo_path = file.path.clone();
+        let display_revision = match &target {
+            ComparisonTarget::Revision(revision) => revision.clone(),
+            ComparisonTarget::Index => "index".into(),
+            ComparisonTarget::Worktree => "working tree".into(),
+        };
+
+        cx.spawn(async move |_this, cx| {
+            if target == ComparisonTarget::Worktree && file_status != CommitFileStatus::Deleted {
+                let buffer = project
+                    .update(cx, |project, cx| project.open_buffer(project_path, cx))
+                    .await?;
+                let diff = project
+                    .update(cx, |project, cx| {
+                        project.git_store().update(cx, |git_store, cx| {
+                            git_store.open_diff_since(old_oid, buffer.clone(), repo, cx)
+                        })
+                    })
+                    .await?;
+                return Ok(LoadedDiffBuffer {
+                    display_buffer: buffer.clone(),
+                    main_buffer: buffer,
+                    diff,
+                    conflict_set: None,
+                });
+            }
+
+            let (mut old_text, mut new_text) = if is_binary {
+                (None, "(binary file not shown)".to_string())
+            } else {
+                let old_text = match old_oid {
+                    Some(oid) => Some(
+                        repo.update(cx, |repo, cx| repo.load_blob_content(oid, cx))
+                            .await?,
+                    ),
+                    None => None,
+                };
+                let new_text = match new_oid {
+                    Some(oid) => {
+                        repo.update(cx, |repo, cx| repo.load_blob_content(oid, cx))
+                            .await?
+                    }
+                    None => String::new(),
+                };
+                (old_text, new_text)
+            };
+            if let Some(old_text) = &mut old_text {
+                text::LineEnding::normalize(old_text);
+            }
+            text::LineEnding::normalize(&mut new_text);
+
+            let full_path = repo.read_with(cx, |repo, _| {
+                repo.work_directory_abs_path.join(repo_path.as_std_path())
+            });
+            let file = Arc::new(ComparisonFile {
+                path: project_path.path,
+                full_path,
+                worktree_id: project_path.worktree_id,
+                display_name: format!(
+                    "{} - {}",
+                    display_revision,
+                    repo_path
+                        .file_name()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| repo_path.as_unix_str().to_string())
+                ),
+                was_deleted: new_oid.is_none(),
+                is_binary,
+            }) as Arc<dyn language::File>;
+            let language_registry = project.update(cx, |project, _| project.languages().clone());
+            let buffer_language_registry = language_registry.clone();
+            let buffer = cx.new(|cx| {
+                let mut buffer = Buffer::local(&new_text, cx);
+                buffer.file_updated(file, cx);
+                buffer.set_language_registry(buffer_language_registry);
+                buffer.set_capability(Capability::ReadOnly, cx);
+                buffer
+            });
+            let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+            let diff = cx.new(|cx| {
+                BufferDiff::new(
+                    &snapshot,
+                    snapshot.language().cloned(),
+                    Some(language_registry),
+                    cx,
+                )
+            });
+            diff.update(cx, |diff, cx| {
+                diff.set_base_text(old_text.map(Into::into), snapshot.text, cx)
+            })
+            .await;
+
+            Ok(LoadedDiffBuffer {
+                display_buffer: buffer.clone(),
+                main_buffer: buffer,
+                diff,
+                conflict_set: None,
+            })
+        })
     }
 
     #[instrument(skip_all)]
@@ -479,6 +703,7 @@ impl DiffBufferList {
                     };
                     (buffer, diff)
                 }
+                DiffBase::Comparison { .. } => unreachable!(),
             };
             let conflict_set = if load_conflict_set {
                 Some(
@@ -502,6 +727,80 @@ impl DiffBufferList {
         });
         task
     }
+}
+
+struct ComparisonFile {
+    path: Arc<RelPath>,
+    full_path: PathBuf,
+    worktree_id: WorktreeId,
+    display_name: String,
+    was_deleted: bool,
+    is_binary: bool,
+}
+
+impl language::File for ComparisonFile {
+    fn as_local(&self) -> Option<&dyn language::LocalFile> {
+        None
+    }
+
+    fn disk_state(&self) -> DiskState {
+        DiskState::Historic {
+            was_deleted: self.was_deleted,
+        }
+    }
+
+    fn path(&self) -> &Arc<RelPath> {
+        &self.path
+    }
+
+    fn full_path(&self, _: &App) -> PathBuf {
+        self.full_path.clone()
+    }
+
+    fn path_style(&self, _: &App) -> PathStyle {
+        PathStyle::local()
+    }
+
+    fn file_name<'a>(&'a self, _: &'a App) -> &'a str {
+        &self.display_name
+    }
+
+    fn worktree_id(&self, _: &App) -> WorktreeId {
+        self.worktree_id
+    }
+
+    fn to_proto(&self, _: &App) -> language::proto::File {
+        language::proto::File {
+            worktree_id: self.worktree_id.to_proto(),
+            entry_id: None,
+            path: self.path.as_unix_str().to_owned(),
+            mtime: None,
+            is_deleted: self.was_deleted,
+            is_historic: true,
+        }
+    }
+
+    fn is_private(&self) -> bool {
+        false
+    }
+
+    fn can_open(&self) -> bool {
+        !self.is_binary
+    }
+}
+
+fn comparison_file_status(status: CommitFileStatus) -> FileStatus {
+    let status = match status {
+        CommitFileStatus::Added => StatusCode::Added,
+        CommitFileStatus::Deleted => StatusCode::Deleted,
+        CommitFileStatus::Renamed => StatusCode::Renamed,
+        CommitFileStatus::Copied => StatusCode::Copied,
+        CommitFileStatus::Modified => StatusCode::Modified,
+    };
+    FileStatus::Tracked(TrackedStatus {
+        index_status: status,
+        worktree_status: StatusCode::Unmodified,
+    })
 }
 
 fn diff_status_to_file_status(branch_diff: &git::status::TreeDiffStatus) -> FileStatus {
