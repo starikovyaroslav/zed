@@ -16,6 +16,20 @@ actions!(
         CopyCommitTag,
         /// Opens the commit view for the selected commit.
         OpenCommitView,
+        /// Marks a commit as one endpoint for a later comparison.
+        SelectCommitForComparison,
+        /// Compares the selected commit with HEAD.
+        CompareCommitWithHead,
+        /// Compares the selected commit with the checked-out branch.
+        CompareCommitWithCurrentBranch,
+        /// Compares the selected commit with the current index.
+        CompareCommitWithIndex,
+        /// Compares the selected commit with the current working tree.
+        CompareCommitWithWorkingTree,
+        /// Compares the selected commit with the previously marked commit.
+        CompareCommitWithSelected,
+        /// Shows the cumulative diff for the range between two selected commits.
+        CompareCommitRange,
     ]
 );
 
@@ -40,6 +54,7 @@ pub(crate) fn commit_context_menu(
     focus_handle: FocusHandle,
     repository: Option<WeakEntity<Repository>>,
     workspace: WeakEntity<Workspace>,
+    has_comparison_base: bool,
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<ContextMenu> {
@@ -138,6 +153,61 @@ pub(crate) fn commit_context_menu(
                         cx,
                     );
                 })
+            })
+            .when(source == CommitContextMenuSource::GitGraph, |menu| {
+                menu.separator()
+                    .entry(
+                        "Compare with HEAD",
+                        Some(CompareCommitWithHead.boxed_clone()),
+                        |window, cx| {
+                            window.dispatch_action(CompareCommitWithHead.boxed_clone(), cx);
+                        },
+                    )
+                    .entry(
+                        "Compare with Current Branch",
+                        Some(CompareCommitWithCurrentBranch.boxed_clone()),
+                        |window, cx| {
+                            window
+                                .dispatch_action(CompareCommitWithCurrentBranch.boxed_clone(), cx);
+                        },
+                    )
+                    .entry(
+                        "Compare with Index",
+                        Some(CompareCommitWithIndex.boxed_clone()),
+                        |window, cx| {
+                            window.dispatch_action(CompareCommitWithIndex.boxed_clone(), cx);
+                        },
+                    )
+                    .entry(
+                        "Compare with Working Tree",
+                        Some(CompareCommitWithWorkingTree.boxed_clone()),
+                        |window, cx| {
+                            window.dispatch_action(CompareCommitWithWorkingTree.boxed_clone(), cx);
+                        },
+                    )
+                    .item(
+                        ContextMenuEntry::new("Compare with Selected Commit")
+                            .action(CompareCommitWithSelected.boxed_clone())
+                            .disabled(!has_comparison_base)
+                            .handler(|window, cx| {
+                                window.dispatch_action(CompareCommitWithSelected.boxed_clone(), cx);
+                            }),
+                    )
+                    .item(
+                        ContextMenuEntry::new("Show Selected Range Changes")
+                            .action(CompareCommitRange.boxed_clone())
+                            .disabled(!has_comparison_base)
+                            .handler(|window, cx| {
+                                window.dispatch_action(CompareCommitRange.boxed_clone(), cx);
+                            }),
+                    )
+                    .entry(
+                        "Select for Comparison",
+                        Some(SelectCommitForComparison.boxed_clone()),
+                        |window, cx| {
+                            window.dispatch_action(SelectCommitForComparison.boxed_clone(), cx);
+                        },
+                    )
             })
             .map(|mut menu| {
                 menu = menu.separator().header("Custom Commands");
