@@ -55,6 +55,8 @@ actions!(
         PopCurrentStash,
         DropCurrentStash,
         OpenFileAtHead,
+        OpenBeforeVersion,
+        OpenAfterVersion,
     ]
 );
 
@@ -85,6 +87,7 @@ pub struct CommitView {
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     remote: Option<GitRemote>,
+    buffer_diffs: HashMap<language::BufferId, Entity<BufferDiff>>,
 }
 
 struct GitBlob {
@@ -120,6 +123,7 @@ impl Addon for CommitDiffAddon {
         _window: &mut Window,
         cx: &mut App,
     ) -> ContextMenu {
+        let buffer_id = buffer.remote_id();
         let file_to_open = buffer.file().and_then(|file| {
             let commit_view = self.commit_view.upgrade()?;
             let commit_view = commit_view.read(cx);
@@ -149,6 +153,27 @@ impl Addon for CommitDiffAddon {
                         .log_err();
                 },
             )
+        })
+        .separator()
+        .entry("Open Before Version", Some(Box::new(OpenBeforeVersion)), {
+            let commit_view = self.commit_view.clone();
+            move |window, cx| {
+                commit_view
+                    .update(cx, |view, cx| {
+                        view.open_buffer_version(buffer_id, true, window, cx)
+                    })
+                    .log_err();
+            }
+        })
+        .entry("Open After Version", Some(Box::new(OpenAfterVersion)), {
+            let commit_view = self.commit_view.clone();
+            move |window, cx| {
+                commit_view
+                    .update(cx, |view, cx| {
+                        view.open_buffer_version(buffer_id, false, window, cx)
+                    })
+                    .log_err();
+            }
         })
     }
 }
@@ -298,6 +323,8 @@ impl CommitView {
         cx.spawn_in(window, async move |this, cx| {
             let mut binary_buffer_ids: HashSet<language::BufferId> = HashSet::default();
             let mut file_statuses: HashMap<language::BufferId, FileStatus> = HashMap::default();
+            let mut buffer_diffs: HashMap<language::BufferId, Entity<BufferDiff>> =
+                HashMap::default();
 
             for file in commit_diff.files {
                 let is_created = file.old_text.is_none();
@@ -402,6 +429,7 @@ impl CommitView {
                     };
                     (ranges, path)
                 })?;
+                buffer_diffs.insert(buffer_id, buffer_diff.clone());
 
                 // Batch the insertion of excerpts and yield between batches, to avoid blocking the main thread when a single file has many hunks.
                 const EXCERPT_BATCH_SIZE: usize = 10;
@@ -434,6 +462,7 @@ impl CommitView {
 
             this.update(cx, |this, cx| {
                 let commit_view = cx.weak_entity();
+                this.buffer_diffs = buffer_diffs;
                 this.editor.update(cx, |editor, cx| {
                     editor.rhs_editor().update(cx, |editor, _cx| {
                         editor.register_addon(CommitDiffAddon {
@@ -482,6 +511,7 @@ impl CommitView {
             project,
             workspace,
             remote,
+            buffer_diffs: HashMap::default(),
         }
     }
 
@@ -551,12 +581,67 @@ impl CommitView {
         self.open_file_at_head(&file, window, cx);
     }
 
+    fn open_buffer_version(
+        &mut self,
+        buffer_id: language::BufferId,
+        before: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(after_buffer) = self.multibuffer.read(cx).buffer(buffer_id) else {
+            return;
+        };
+        let buffer = if before {
+            let Some(diff) = self.buffer_diffs.get(&buffer_id) else {
+                return;
+            };
+            let before_buffer = diff.read(cx).base_text_buffer().clone();
+            if let Some(after_file) = after_buffer.read(cx).file() {
+                let file_name = after_file.file_name(cx).to_string();
+                let display_name = format!(
+                    "{}^ - {}",
+                    self.commit.short_sha(),
+                    file_name
+                        .rsplit_once(" - ")
+                        .map(|(_, name)| name)
+                        .unwrap_or(&file_name)
+                );
+                let file = Arc::new(GitBlob {
+                    path: RepoPath::from_rel_path(after_file.path()),
+                    worktree_id: after_file.worktree_id(cx),
+                    is_deleted: false,
+                    is_binary: false,
+                    display_name,
+                }) as Arc<dyn language::File>;
+                before_buffer.update(cx, |buffer, cx| {
+                    buffer.file_updated(file, cx);
+                    buffer.set_capability(Capability::ReadOnly, cx);
+                });
+            }
+            before_buffer
+        } else {
+            after_buffer
+        };
+        let project = self.project.clone();
+        let editor = cx.new(|cx| Editor::for_buffer(buffer, Some(project), window, cx));
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(editor), None, true, window, cx);
+            })
+            .log_err();
+    }
+
     fn render_header(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let commit = &self.commit;
         let author_name = commit.author_name.clone();
         let author_email = commit.author_email.clone();
         let commit_sha = commit.sha.clone();
-        let commit_date = time::OffsetDateTime::from_unix_timestamp(commit.commit_timestamp)
+        let authored_at = if commit.author_timestamp == 0 {
+            commit.commit_timestamp
+        } else {
+            commit.author_timestamp
+        };
+        let commit_date = time::OffsetDateTime::from_unix_timestamp(authored_at)
             .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
         let local_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
         let date_string = time_format::format_localized_timestamp(
@@ -702,6 +787,111 @@ impl CommitView {
                     }),
             )
             .children(self.render_commit_message(avatar_container_width, window, cx))
+            .children(self.render_commit_metadata(avatar_container_width, cx))
+    }
+
+    fn render_commit_metadata(&self, avatar_spacer: Pixels, _cx: &App) -> Option<impl IntoElement> {
+        let commit = &self.commit;
+        let committed_at = time::OffsetDateTime::from_unix_timestamp(commit.commit_timestamp)
+            .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+        let local_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+        let committed_at = time_format::format_localized_timestamp(
+            committed_at,
+            time::OffsetDateTime::now_utc(),
+            local_offset,
+            time_format::TimestampFormat::MediumAbsolute,
+        );
+        let has_committer = !commit.committer_name.is_empty()
+            && (commit.committer_name != commit.author_name
+                || commit.committer_email != commit.author_email);
+        let has_metadata = !commit.parents.is_empty()
+            || !commit.ref_names.is_empty()
+            || has_committer
+            || commit.commit_timestamp != 0
+            || commit.signature.is_some();
+        has_metadata.then(|| {
+            h_flex()
+                .w_full()
+                .pr_2p5()
+                .child(h_flex().flex_none().w(avatar_spacer))
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .gap_1()
+                        .when(!commit.parents.is_empty(), |this| {
+                            let parents = commit
+                                .parents
+                                .iter()
+                                .map(|parent| {
+                                    parent
+                                        .get(..git::SHORT_SHA_LENGTH)
+                                        .unwrap_or(parent)
+                                        .to_string()
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            this.child(
+                                Label::new(format!("Parents: {parents}"))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        })
+                        .when(!commit.ref_names.is_empty(), |this| {
+                            this.child(
+                                Label::new(format!("Refs: {}", commit.ref_names.join(", ")))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        })
+                        .when(has_committer, |this| {
+                            this.child(
+                                Label::new(format!(
+                                    "Committed by {} <{}>",
+                                    commit.committer_name, commit.committer_email
+                                ))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                            )
+                        })
+                        .when(commit.commit_timestamp != 0, |this| {
+                            this.child(
+                                Label::new(format!("Committed: {committed_at}"))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        })
+                        .when_some(commit.signature.as_ref(), |this, signature| {
+                            let label = if signature.signer.is_empty() {
+                                format!("Signature: {}", signature.status)
+                            } else {
+                                format!(
+                                    "Signature: {} — {} ({})",
+                                    signature.status, signature.signer, signature.key
+                                )
+                            };
+                            let details = [
+                                (!signature.fingerprint.is_empty())
+                                    .then(|| format!("Fingerprint: {}", signature.fingerprint)),
+                                (!signature.primary_key_fingerprint.is_empty()).then(|| {
+                                    format!(
+                                        "Primary fingerprint: {}",
+                                        signature.primary_key_fingerprint
+                                    )
+                                }),
+                                (!signature.trust_level.is_empty())
+                                    .then(|| format!("Trust: {}", signature.trust_level)),
+                            ]
+                            .into_iter()
+                            .flatten();
+                            this.child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                                .children(details.map(|detail| {
+                                    Label::new(detail)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                }))
+                        }),
+                )
+        })
     }
 
     fn render_commit_message(
@@ -1227,6 +1417,7 @@ impl Item for CommitView {
                 project: self.project.clone(),
                 workspace: self.workspace.clone(),
                 remote: self.remote.clone(),
+                buffer_diffs: self.buffer_diffs.clone(),
             }
         })))
     }

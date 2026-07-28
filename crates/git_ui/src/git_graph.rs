@@ -1,5 +1,10 @@
-pub use crate::commit_context_menu::{CopyCommitSha, CopyCommitTag, OpenCommitView};
+pub use crate::commit_context_menu::{
+    CompareCommitRange, CompareCommitWithCurrentBranch, CompareCommitWithHead,
+    CompareCommitWithIndex, CompareCommitWithSelected, CompareCommitWithWorkingTree, CopyCommitSha,
+    CopyCommitTag, OpenCommitView, SelectCommitForComparison,
+};
 use crate::{
+    branch_diff::BranchDiff,
     commit_context_menu::{CommitContextMenuData, CommitContextMenuSource, commit_context_menu},
     commit_tooltip::CommitAvatar,
     commit_view::CommitView,
@@ -12,8 +17,8 @@ use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
     repository::{
-        CommitDiff, CommitFile, InitialGraphCommitData, LogOrder, LogSource, RepoPath,
-        SearchCommitArgs,
+        CommitDiff, CommitFile, CommitFileStatus, InitialGraphCommitData, LogOrder, LogSource,
+        RepoPath, SearchCommitArgs,
     },
     status::{FileStatus, StatusCode, TrackedStatus},
 };
@@ -33,7 +38,7 @@ use project::{
     ProjectPath,
     git_store::{
         CommitDataState, GitGraphEvent, GitStore, GitStoreEvent, GraphDataResponse, Repository,
-        RepositoryEvent, RepositoryId,
+        RepositoryEvent, RepositoryId, diff_buffer_list::ComparisonTarget,
     },
 };
 use search::{
@@ -212,6 +217,9 @@ struct ChangedFileEntry {
     file_name: SharedString,
     dir_path: SharedString,
     repo_path: RepoPath,
+    renamed_from: Option<SharedString>,
+    additions: Option<u32>,
+    deletions: Option<u32>,
 }
 
 impl ChangedFileEntry {
@@ -229,10 +237,12 @@ impl ChangedFileEntry {
             .unwrap_or_default()
             .into();
 
-        let status_code = match (&file.old_text, &file.new_text) {
-            (None, Some(_)) => StatusCode::Added,
-            (Some(_), None) => StatusCode::Deleted,
-            _ => StatusCode::Modified,
+        let status_code = match file.status() {
+            CommitFileStatus::Added => StatusCode::Added,
+            CommitFileStatus::Deleted => StatusCode::Deleted,
+            CommitFileStatus::Renamed => StatusCode::Renamed,
+            CommitFileStatus::Copied => StatusCode::Copied,
+            CommitFileStatus::Modified => StatusCode::Modified,
         };
 
         let status = FileStatus::Tracked(TrackedStatus {
@@ -245,6 +255,12 @@ impl ChangedFileEntry {
             file_name,
             dir_path,
             repo_path: file.path.clone(),
+            renamed_from: file
+                .old_path
+                .as_ref()
+                .map(|path| path.as_unix_str().to_string().into()),
+            additions: file.additions,
+            deletions: file.deletions,
         }
     }
 
@@ -279,6 +295,9 @@ impl ChangedFileEntry {
     ) -> AnyElement {
         let file_name = self.file_name.clone();
         let dir_path = self.dir_path.clone();
+        let renamed_from = self.renamed_from.clone();
+        let additions = self.additions;
+        let deletions = self.deletions;
 
         ListItem::new(("changed-file", ix))
             .spacing(ListItemSpacing::Sparse)
@@ -298,12 +317,30 @@ impl ChangedFileEntry {
                         .truncate_start(),
                 )
             })
+            .when_some(renamed_from.clone(), |this, renamed_from| {
+                this.child(
+                    Label::new(format!("from {renamed_from}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate_start(),
+                )
+            })
+            .when(additions.is_some() || deletions.is_some(), |this| {
+                this.end_slot(DiffStat::new(
+                    ("changed-file-stat", ix),
+                    additions.unwrap_or(0) as usize,
+                    deletions.unwrap_or(0) as usize,
+                ))
+            })
             .tooltip({
-                let meta = if dir_path.is_empty() {
+                let path = if dir_path.is_empty() {
                     file_name
                 } else {
                     format!("{}/{}", dir_path, file_name).into()
                 };
+                let meta: SharedString = renamed_from
+                    .map(|old_path| format!("{old_path} → {path}").into())
+                    .unwrap_or(path);
                 move |_, cx| Tooltip::with_meta("View Changes", None, meta.clone(), cx)
             })
             .on_click({
@@ -1277,6 +1314,9 @@ fn draw_commit_circle(center_x: Pixels, center_y: Pixels, color: Hsla, window: &
 
 fn compute_diff_stats(diff: &CommitDiff) -> (usize, usize) {
     diff.files.iter().fold((0, 0), |(added, removed), file| {
+        if let (Some(additions), Some(deletions)) = (file.additions, file.deletions) {
+            return (added + additions as usize, removed + deletions as usize);
+        }
         let old_text = file.old_text.as_deref().unwrap_or("");
         let new_text = file.new_text.as_deref().unwrap_or("");
         let hunks = line_diff(old_text, new_text);
@@ -1323,19 +1363,34 @@ pub struct GitGraph {
     log_order: LogOrder,
     selected_commit_diff: Option<CommitDiff>,
     selected_commit_diff_stats: Option<(usize, usize)>,
+    selected_commit_diff_error: Option<SharedString>,
     _commit_diff_task: Option<Task<()>>,
     selected_commit_message: Option<DetailPanelCommitMessage>,
     _selected_commit_message_task: Option<Task<()>>,
     commit_details_split_state: Entity<SplitState>,
     repo_id: RepositoryId,
     changed_files_scroll_handle: UniformListScrollHandle,
+    changed_files_search_editor: Entity<Editor>,
     changed_files_view_mode: ChangedFilesViewMode,
     changed_files_expanded_dirs: HashMap<RepoPath, bool>,
     pending_select_sha: Option<Oid>,
+    comparison_base: Option<Oid>,
 }
 
 impl GitGraph {
     fn invalidate_state(&mut self, cx: &mut Context<Self>) {
+        self.pending_select_sha = self
+            .selected_entry_idx
+            .and_then(|index| self.graph_data.commits.get(index))
+            .map(|commit| commit.data.sha);
+        self.selected_entry_idx = None;
+        self.selected_commit_diff = None;
+        self.selected_commit_diff_stats = None;
+        self.selected_commit_diff_error = None;
+        self.selected_commit_message = None;
+        self._commit_diff_task = None;
+        self._selected_commit_message_task = None;
+        self.changed_files_expanded_dirs.clear();
         self.graph_data.clear();
         self.search_state.matches.clear();
         self.search_state.selected_index = None;
@@ -1475,6 +1530,13 @@ impl GitGraph {
             editor.set_placeholder_text("Search commits…", window, cx);
             editor
         });
+        let changed_files_search_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Filter changed files…", window, cx);
+            editor
+        });
+        cx.observe(&changed_files_search_editor, |_, _, cx| cx.notify())
+            .detach();
 
         let table_interaction_state = cx.new(|cx| {
             let mut state = TableInteractionState::new(cx);
@@ -1568,6 +1630,7 @@ impl GitGraph {
             graph_canvas_bounds: Rc::new(Cell::new(None)),
             selected_commit_diff: None,
             selected_commit_diff_stats: None,
+            selected_commit_diff_error: None,
             selected_commit_message: None,
             _selected_commit_message_task: None,
             log_source,
@@ -1575,9 +1638,11 @@ impl GitGraph {
             commit_details_split_state: cx.new(|_cx| SplitState::new()),
             repo_id,
             changed_files_scroll_handle: UniformListScrollHandle::new(),
+            changed_files_search_editor,
             changed_files_view_mode: ChangedFilesViewMode::default(),
             changed_files_expanded_dirs: HashMap::default(),
             pending_select_sha: None,
+            comparison_base: None,
         };
 
         this.fetch_initial_graph_data(cx);
@@ -1661,14 +1726,12 @@ impl GitGraph {
                 // meaning we are not inside the initial repo loading state
                 // NOTE: this fixes an loading performance regression
                 if repository.read(cx).scan_id > 1 {
-                    self.pending_select_sha = None;
                     self.invalidate_state(cx);
                 }
             }
             RepositoryEvent::StashEntriesChanged if self.log_source == LogSource::All => {
                 // Stash entries initial's scan id is 2, so we don't want to invalidate the graph before that
                 if repository.read(cx).scan_id > 2 {
-                    self.pending_select_sha = None;
                     self.invalidate_state(cx);
                 }
             }
@@ -1927,6 +1990,7 @@ impl GitGraph {
         self.selected_entry_idx = None;
         self.selected_commit_diff = None;
         self.selected_commit_diff_stats = None;
+        self.selected_commit_diff_error = None;
         self.changed_files_expanded_dirs.clear();
         cx.emit(ItemEvent::Edit);
         cx.notify();
@@ -2131,6 +2195,7 @@ impl GitGraph {
         self.selected_entry_idx = Some(idx);
         self.selected_commit_diff = None;
         self.selected_commit_diff_stats = None;
+        self.selected_commit_diff_error = None;
         self.changed_files_expanded_dirs.clear();
         self.changed_files_scroll_handle
             .scroll_to_item(0, ScrollStrategy::Top);
@@ -2149,21 +2214,40 @@ impl GitGraph {
 
         let commit_message_handle = commit.data.sha;
         let diff_handle = commit.data.sha.to_string();
+        let selected_sha = commit.data.sha;
 
         self.load_selected_commit_message(cx, &commit_message_handle, &repository);
 
-        let diff_receiver = repository.update(cx, |repo, _| repo.load_commit_diff(diff_handle));
+        let diff_receiver =
+            repository.update(cx, |repo, _| repo.load_commit_diff_metadata(diff_handle));
 
         self._commit_diff_task = Some(cx.spawn(async move |this, cx| {
-            if let Ok(Ok(diff)) = diff_receiver.await {
-                this.update(cx, |this, cx| {
-                    let stats = compute_diff_stats(&diff);
-                    this.selected_commit_diff = Some(diff);
-                    this.selected_commit_diff_stats = Some(stats);
-                    cx.notify();
-                })
-                .ok();
-            }
+            let result = diff_receiver.await;
+            this.update(cx, |this, cx| {
+                let is_still_selected = this
+                    .selected_entry_idx
+                    .and_then(|index| this.graph_data.commits.get(index))
+                    .is_some_and(|commit| commit.data.sha == selected_sha);
+                if !is_still_selected {
+                    return;
+                }
+                match result {
+                    Ok(Ok(diff)) => {
+                        let stats = compute_diff_stats(&diff);
+                        this.selected_commit_diff = Some(diff);
+                        this.selected_commit_diff_stats = Some(stats);
+                        this.selected_commit_diff_error = None;
+                    }
+                    Ok(Err(error)) => {
+                        this.selected_commit_diff_error = Some(error.to_string().into());
+                    }
+                    Err(error) => {
+                        this.selected_commit_diff_error = Some(error.to_string().into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
         }));
 
         cx.emit(ItemEvent::Edit);
@@ -2324,6 +2408,219 @@ impl GitGraph {
         self.open_commit_view(selected_entry_index, window, cx);
     }
 
+    fn comparison_target_index(&self) -> Option<usize> {
+        self.context_menu
+            .as_ref()
+            .and_then(|menu| menu.target_entry_index)
+            .or(self.selected_entry_idx)
+    }
+
+    fn select_commit_for_comparison(
+        &mut self,
+        _: &SelectCommitForComparison,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.comparison_target_index() else {
+            return;
+        };
+        self.comparison_base = self
+            .graph_data
+            .commits
+            .get(index)
+            .map(|commit| commit.data.sha);
+        cx.notify();
+    }
+
+    fn deploy_revision_comparison(
+        &self,
+        base: SharedString,
+        target: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.deploy_comparison(base, ComparisonTarget::Revision(target), window, cx);
+    }
+
+    fn deploy_comparison(
+        &self,
+        base: SharedString,
+        target: ComparisonTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        self.workspace
+            .update(cx, |workspace, cx| {
+                BranchDiff::deploy_comparison(workspace, repository, base, target, window, cx);
+            })
+            .log_err();
+    }
+
+    fn compare_commit_with_head(
+        &mut self,
+        _: &CompareCommitWithHead,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(commit) = self
+            .comparison_target_index()
+            .and_then(|index| self.graph_data.commits.get(index))
+        else {
+            return;
+        };
+        self.deploy_revision_comparison(
+            commit.data.sha.to_string().into(),
+            "HEAD".into(),
+            window,
+            cx,
+        );
+    }
+
+    fn compare_commit_with_current_branch(
+        &mut self,
+        _: &CompareCommitWithCurrentBranch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let branch_name = repository
+            .read(cx)
+            .snapshot()
+            .branch
+            .as_ref()
+            .map(|branch| branch.ref_name.clone());
+        let Some(branch_name) = branch_name else {
+            self.compare_commit_with_head(&CompareCommitWithHead, window, cx);
+            return;
+        };
+        let Some(commit) = self
+            .comparison_target_index()
+            .and_then(|index| self.graph_data.commits.get(index))
+        else {
+            return;
+        };
+        self.deploy_revision_comparison(
+            commit.data.sha.to_string().into(),
+            branch_name,
+            window,
+            cx,
+        );
+    }
+
+    fn compare_commit_with_index(
+        &mut self,
+        _: &CompareCommitWithIndex,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(commit) = self
+            .comparison_target_index()
+            .and_then(|index| self.graph_data.commits.get(index))
+        else {
+            return;
+        };
+        self.deploy_comparison(
+            commit.data.sha.to_string().into(),
+            ComparisonTarget::Index,
+            window,
+            cx,
+        );
+    }
+
+    fn compare_commit_with_working_tree(
+        &mut self,
+        _: &CompareCommitWithWorkingTree,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(commit) = self
+            .comparison_target_index()
+            .and_then(|index| self.graph_data.commits.get(index))
+        else {
+            return;
+        };
+        self.deploy_comparison(
+            commit.data.sha.to_string().into(),
+            ComparisonTarget::Worktree,
+            window,
+            cx,
+        );
+    }
+
+    fn compare_commit_with_selected(
+        &mut self,
+        _: &CompareCommitWithSelected,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(base) = self.comparison_base else {
+            return;
+        };
+        let Some(target) = self
+            .comparison_target_index()
+            .and_then(|index| self.graph_data.commits.get(index))
+            .map(|commit| commit.data.sha)
+        else {
+            return;
+        };
+        self.deploy_revision_comparison(
+            base.to_string().into(),
+            target.to_string().into(),
+            window,
+            cx,
+        );
+    }
+
+    fn compare_commit_range(
+        &mut self,
+        _: &CompareCommitRange,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(base_sha) = self.comparison_base else {
+            return;
+        };
+        let Some(target_index) = self.comparison_target_index() else {
+            return;
+        };
+        let Some(base_index) = self
+            .graph_data
+            .commits
+            .iter()
+            .position(|commit| commit.data.sha == base_sha)
+        else {
+            return;
+        };
+        let (newer_index, older_index) = if base_index <= target_index {
+            (base_index, target_index)
+        } else {
+            (target_index, base_index)
+        };
+        let Some(newer) = self.graph_data.commits.get(newer_index) else {
+            return;
+        };
+        let Some(older) = self.graph_data.commits.get(older_index) else {
+            return;
+        };
+        let base = older
+            .data
+            .parents
+            .first()
+            .copied()
+            .unwrap_or(older.data.sha);
+        self.deploy_revision_comparison(
+            base.to_string().into(),
+            newer.data.sha.to_string().into(),
+            window,
+            cx,
+        );
+    }
+
     fn open_commit_view(
         &mut self,
         entry_index: usize,
@@ -2436,6 +2733,7 @@ impl GitGraph {
             self.focus_handle.clone(),
             repository,
             self.workspace.clone(),
+            self.comparison_base.is_some(),
             window,
             cx,
         );
@@ -2770,11 +3068,32 @@ impl GitGraph {
         let (total_lines_added, total_lines_removed) =
             self.selected_commit_diff_stats.unwrap_or((0, 0));
 
+        let changed_files_query = self
+            .changed_files_search_editor
+            .read(cx)
+            .text(cx)
+            .to_lowercase();
         let changed_file_entries: Vec<ChangedFileEntry> = self
             .selected_commit_diff
             .as_ref()
             .map(|diff| {
-                let mut files = diff.files.iter().collect::<Vec<_>>();
+                let mut files = diff
+                    .files
+                    .iter()
+                    .filter(|file| {
+                        changed_files_query.is_empty()
+                            || file
+                                .path
+                                .as_unix_str()
+                                .to_lowercase()
+                                .contains(&changed_files_query)
+                            || file.old_path.as_ref().is_some_and(|path| {
+                                path.as_unix_str()
+                                    .to_lowercase()
+                                    .contains(&changed_files_query)
+                            })
+                    })
+                    .collect::<Vec<_>>();
                 if !self.changed_files_view_mode.is_tree() {
                     files.sort_by_key(|file| file.status());
                 }
@@ -2784,6 +3103,7 @@ impl GitGraph {
                     .collect()
             })
             .unwrap_or_default();
+        let visible_changed_files_count = changed_file_entries.len();
         let changed_file_entries = Rc::new(changed_file_entries);
         let tree_entries: Rc<Vec<ChangedFileTreeEntry>> = if self.changed_files_view_mode.is_tree()
         {
@@ -2796,6 +3116,12 @@ impl GitGraph {
         };
 
         let is_tree_view = self.changed_files_view_mode.is_tree();
+        let diff_is_loading = self.selected_commit_diff.is_none()
+            && self.selected_commit_diff_error.is_none()
+            && self
+                ._commit_diff_task
+                .as_ref()
+                .is_some_and(|task| !task.is_ready());
         let view_toggle = IconButton::new("toggle-changed-files-view", IconName::ListTree)
             .icon_size(IconSize::Small)
             .toggle_state(self.changed_files_view_mode.is_tree())
@@ -2835,6 +3161,7 @@ impl GitGraph {
                                     this.selected_entry_idx = None;
                                     this.selected_commit_diff = None;
                                     this.selected_commit_diff_stats = None;
+                                    this.selected_commit_diff_error = None;
                                     this.selected_commit_message = None;
                                     this._selected_commit_message_task = None;
                                     this.changed_files_expanded_dirs.clear();
@@ -3047,80 +3374,148 @@ impl GitGraph {
                             )),
                     )
                     .child(
-                        div()
-                            .id("changed-files-container")
-                            .flex_1()
-                            .min_h_0()
-                            .child({
-                                let flat_entries = changed_file_entries;
+                        h_flex()
+                            .mx_2()
+                            .mb_1()
+                            .h_8()
+                            .px_1p5()
+                            .border_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .rounded_md()
+                            .bg(cx.theme().colors().toolbar_background)
+                            .child(self.changed_files_search_editor.clone()),
+                    )
+                    .when_some(self.selected_commit_diff_error.clone(), |this, error| {
+                        this.child(
+                            v_flex()
+                                .flex_1()
+                                .items_center()
+                                .justify_center()
+                                .gap_1()
+                                .child(
+                                    Label::new("Unable to load changed files").color(Color::Error),
+                                )
+                                .child(
+                                    Label::new(error).size(LabelSize::Small).color(Color::Muted),
+                                ),
+                        )
+                    })
+                    .when(diff_is_loading, |this| {
+                        this.child(
+                            h_flex()
+                                .flex_1()
+                                .items_center()
+                                .justify_center()
+                                .gap_1()
+                                .child(Label::new("Loading changed files").color(Color::Muted))
+                                .child(self.render_loading_spinner(cx)),
+                        )
+                    })
+                    .when(
+                        self.selected_commit_diff_error.is_none()
+                            && !diff_is_loading
+                            && visible_changed_files_count == 0,
+                        |this| {
+                            this.child(
+                                h_flex().flex_1().items_center().justify_center().child(
+                                    Label::new(if changed_files_query.is_empty() {
+                                        "No changed files"
+                                    } else {
+                                        "No changed files match the filter"
+                                    })
+                                    .color(Color::Muted),
+                                ),
+                            )
+                        },
+                    )
+                    .when(
+                        self.selected_commit_diff_error.is_none()
+                            && !diff_is_loading
+                            && visible_changed_files_count > 0,
+                        |this| {
+                            this.child(
+                                div()
+                                    .id("changed-files-container")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .child({
+                                        let flat_entries = changed_file_entries;
 
-                                let entry_count = if is_tree_view {
-                                    tree_entries.len()
-                                } else {
-                                    flat_entries.len()
-                                };
-                                let commit_sha = full_sha.clone();
-                                let repository = repository.downgrade();
-                                let workspace = self.workspace.clone();
-                                let git_graph = cx.weak_entity();
-                                let indent_tree_entries = tree_entries.clone();
+                                        let entry_count = if is_tree_view {
+                                            tree_entries.len()
+                                        } else {
+                                            flat_entries.len()
+                                        };
+                                        let commit_sha = full_sha.clone();
+                                        let repository = repository.downgrade();
+                                        let workspace = self.workspace.clone();
+                                        let git_graph = cx.weak_entity();
+                                        let indent_tree_entries = tree_entries.clone();
 
-                                uniform_list(
-                                    "changed-files-list",
-                                    entry_count,
-                                    move |range, _window, cx| {
-                                        range
-                                            .map(|ix| {
-                                                if is_tree_view {
-                                                    match &tree_entries[ix] {
-                                                        ChangedFileTreeEntry::Directory(entry) => {
-                                                            entry.render(ix, git_graph.clone(), cx)
-                                                        }
-                                                        ChangedFileTreeEntry::File(entry) => {
-                                                            entry.entry.render(
+                                        uniform_list(
+                                            "changed-files-list",
+                                            entry_count,
+                                            move |range, _window, cx| {
+                                                range
+                                                    .map(|ix| {
+                                                        if is_tree_view {
+                                                            match &tree_entries[ix] {
+                                                                ChangedFileTreeEntry::Directory(
+                                                                    entry,
+                                                                ) => entry.render(
+                                                                    ix,
+                                                                    git_graph.clone(),
+                                                                    cx,
+                                                                ),
+                                                                ChangedFileTreeEntry::File(
+                                                                    entry,
+                                                                ) => entry.entry.render(
+                                                                    ix,
+                                                                    entry.depth,
+                                                                    None,
+                                                                    commit_sha.clone(),
+                                                                    repository.clone(),
+                                                                    workspace.clone(),
+                                                                    cx,
+                                                                ),
+                                                            }
+                                                        } else {
+                                                            let directory_label = (!flat_entries
+                                                                [ix]
+                                                                .dir_path
+                                                                .is_empty())
+                                                            .then(|| {
+                                                                flat_entries[ix].dir_path.clone()
+                                                            });
+                                                            flat_entries[ix].render(
                                                                 ix,
-                                                                entry.depth,
-                                                                None,
+                                                                0,
+                                                                directory_label,
                                                                 commit_sha.clone(),
                                                                 repository.clone(),
                                                                 workspace.clone(),
                                                                 cx,
                                                             )
                                                         }
-                                                    }
-                                                } else {
-                                                    let directory_label = (!flat_entries[ix]
-                                                        .dir_path
-                                                        .is_empty())
-                                                    .then(|| flat_entries[ix].dir_path.clone());
-                                                    flat_entries[ix].render(
-                                                        ix,
-                                                        0,
-                                                        directory_label,
-                                                        commit_sha.clone(),
-                                                        repository.clone(),
-                                                        workspace.clone(),
-                                                        cx,
-                                                    )
-                                                }
-                                            })
-                                            .collect()
-                                    },
-                                )
-                                .when(is_tree_view, |list| {
-                                    list.with_decoration(
-                                        ui::indent_guides(
-                                            px(TREE_INDENT),
-                                            IndentGuideColors::panel(cx),
+                                                    })
+                                                    .collect()
+                                            },
                                         )
-                                        .with_left_offset(
-                                            ui::LIST_ITEM_INDENT_GUIDE_LEFT_OFFSET - px(2.),
-                                        )
-                                        .with_compute_indents_fn(
-                                            cx.entity(),
-                                            move |_, range, _window, _cx| {
-                                                range
-                                                    .map(|ix| match indent_tree_entries.get(ix) {
+                                        .when(is_tree_view, |list| {
+                                            list.with_decoration(
+                                                ui::indent_guides(
+                                                    px(TREE_INDENT),
+                                                    IndentGuideColors::panel(cx),
+                                                )
+                                                .with_left_offset(
+                                                    ui::LIST_ITEM_INDENT_GUIDE_LEFT_OFFSET - px(2.),
+                                                )
+                                                .with_compute_indents_fn(
+                                                    cx.entity(),
+                                                    move |_, range, _window, _cx| {
+                                                        range
+                                                            .map(|ix| {
+                                                                match indent_tree_entries.get(ix) {
                                                         Some(ChangedFileTreeEntry::Directory(
                                                             entry,
                                                         )) => entry.depth,
@@ -3128,16 +3523,23 @@ impl GitGraph {
                                                             entry.depth
                                                         }
                                                         None => 0,
-                                                    })
-                                                    .collect()
-                                            },
-                                        ),
-                                    )
-                                })
-                                .size_full()
-                                .track_scroll(&self.changed_files_scroll_handle)
-                            })
-                            .vertical_scrollbar_for(&self.changed_files_scroll_handle, window, cx),
+                                                    }
+                                                            })
+                                                            .collect()
+                                                    },
+                                                ),
+                                            )
+                                        })
+                                        .size_full()
+                                        .track_scroll(&self.changed_files_scroll_handle)
+                                    })
+                                    .vertical_scrollbar_for(
+                                        &self.changed_files_scroll_handle,
+                                        window,
+                                        cx,
+                                    ),
+                            )
+                        },
                     ),
             )
             .child(Divider::horizontal())
@@ -4042,6 +4444,13 @@ impl Render for GitGraph {
             }))
             .on_action(cx.listener(Self::copy_selected_commit_sha))
             .on_action(cx.listener(Self::copy_selected_commit_tag))
+            .on_action(cx.listener(Self::select_commit_for_comparison))
+            .on_action(cx.listener(Self::compare_commit_with_head))
+            .on_action(cx.listener(Self::compare_commit_with_current_branch))
+            .on_action(cx.listener(Self::compare_commit_with_index))
+            .on_action(cx.listener(Self::compare_commit_with_working_tree))
+            .on_action(cx.listener(Self::compare_commit_with_selected))
+            .on_action(cx.listener(Self::compare_commit_range))
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 this.search_state
@@ -6951,6 +7360,57 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_git_graph_refresh_preserves_selection_by_sha(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        let mut rng = StdRng::seed_from_u64(7);
+        let commits = generate_random_commit_dag(&mut rng, 3, false);
+        let selected_sha = commits[1].sha;
+        fs.set_graph_commits(Path::new("/project/.git"), commits);
+
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+        let repository = project
+            .read_with(cx, |project, cx| project.active_repository(cx))
+            .unwrap();
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().downgrade());
+        let graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        graph.update(cx, |graph, cx| {
+            graph.select_entry(1, ScrollStrategy::Nearest, cx);
+            graph.invalidate_state(cx);
+        });
+        graph.read_with(cx, |graph, _| {
+            assert_eq!(graph.pending_select_sha, Some(selected_sha));
+            assert_eq!(graph.selected_entry_idx, None);
+            assert!(graph.selected_commit_diff.is_none());
+            assert!(graph.selected_commit_message.is_none());
+        });
+    }
+
+    #[gpui::test]
     async fn test_global_git_command_task_runs_from_context_menu(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -7408,6 +7868,12 @@ mod tests {
             graph.selected_commit_diff = Some(CommitDiff {
                 files: vec![CommitFile {
                     path: RepoPath::new("file.txt").expect("repository path should be valid"),
+                    old_path: None,
+                    status: CommitFileStatus::Modified,
+                    old_oid: None,
+                    new_oid: None,
+                    additions: Some(1),
+                    deletions: Some(1),
                     old_text: Some("content".into()),
                     new_text: Some("updated content".into()),
                     is_binary: false,
